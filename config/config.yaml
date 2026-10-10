@@ -1,0 +1,127 @@
+# System Configuration for Multimodal Sign Language & Speech Communication
+camera:
+  index: 0
+  width: 640
+  height: 480
+  fps: 30
+
+model_paths:
+  hand_landmarker: models/hand_landmarker.task
+  classifier: models/gesture_classifier.onnx
+  sklearn_classifier: models/gesture_classifier.joblib
+  yolo_roi: null
+  asl_model: models/asl/pytorch_model.bin
+  asl_labels: models/asl/labels.json
+  isl_model: models/isl/best_model.pth
+  isl_labels: models/isl/labels.json
+
+# Recognition Pipeline Configuration
+recognition:
+  language: ASL # "ASL" (default with full local models) or "ISL"
+  mode: ALPHABET # "ALPHABET" or "WORD" or "AUTO"
+  target_fps: 15
+  max_frames: 64
+  min_frames: 8
+  sequence_length: 32
+  min_sign_frames: 8
+  max_sign_frames: 64
+  movement_threshold: 0.015
+  pause_frames: 8
+  word_stabilizer_window: 2
+  word_min_confidence: 0.40
+
+# Confidence Thresholds (Configurable per language)
+thresholds:
+  isl: 0.55 # Configurable cutoff for ISL alphabet/word recognition
+  asl: 0.50 # Configurable cutoff for ASL recognition
+  uncertain_message: "Sign not recognized. Please try again."
+
+# ISL Model Configuration (Hugging Face)
+isl:
+  alphabet_model: "Hemg/Indian-sign-language-classification"
+  device: "auto"
+  confidence_threshold: 0.50
+  word_model:
+    provider: huggingface
+    model_id: "Abs6187/isl-models"
+    checkpoint: "best_model_new.pth"
+    metadata: "metadata.json"
+    hierarchical: true
+    enabled: true
+    device: "auto"
+    num_frames: 30
+    confidence_threshold: 0.50
+
+# Speech-to-Text Configuration (Whisper)
+speech:
+  enabled: true
+  model_name: "openai/whisper-base"
+  language: "en" # "en", "hi", or null for auto-detect
+  device: "auto"
+  chunk_duration_seconds: 3.0
+  sample_rate: 16000
+
+# Common Communication Layer Configuration
+common_text_layer:
+  max_history: 100
+  enable_deduplication: true
+  dedup_window_seconds: 1.5
+
+# Fingerspelling Labels (ASL)
+labels:
+  - "A"
+  - "B"
+  - "C"
+  - "D"
+  - "DEL"
+  - "E"
+  - "F"
+  - "G"
+  - "H"
+  - "I"
+  - "J"
+  - "K"
+  - "L"
+  - "M"
+  - "N"
+  - "O"
+  - "P"
+  - "Q"
+  - "R"
+  - "S"
+  - "SPACE"
+  - "T"
+  - "U"
+  - "V"
+  - "W"
+  - "X"
+  - "Y"
+  - "Z"
+
+stabilizer:
+  window: 8
+  min_ratio: 0.65
+  min_conf: 0.60
+  debounce_frames: 6
+
+text_composer:
+  no_hand_timeout_frames: 45
+  auto_space: true
+
+tts:
+  enabled: true
+  mode: "sentence" # "sentence", "word", or "letter"
+  rate: 165
+  volume: 1.0
+  voice_id: null
+
+gemini:
+  enabled: true
+  api_key: ""
+  model: "gemini-1.5-flash"
+  auto_trigger_on_finish: true
+
+nlp:
+  enable_sentence_understanding: true
+  enable_translation: false
+  target_language: "es"

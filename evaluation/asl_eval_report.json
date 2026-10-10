@@ -1,0 +1,7 @@
+{
+  "alphabet": {
+    "mean_latency_ms": 0.086,
+    "throughput_fps": 11649.9,
+    "iterations": 40
+  }
+}

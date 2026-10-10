@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OmniSign AI — Multimodal Sign Language & Speech Communication</title>
+  <meta name="description" content="Real-Time Multimodal AI Communication System for Indian Sign Language (ISL), American Sign Language (ASL), and Speech-to-Text with Pretrained Transformers.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Ambient background glow elements -->
+  <div class="glow-orb orb-1"></div>
+  <div class="glow-orb orb-2"></div>
+  <div class="glow-orb orb-3"></div>
+
+  <div class="app-container">
+    <!-- Header / Navbar -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-logo">
+          <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8z" opacity="0.3"/>
+            <path d="M7 11.5a2.5 2.5 0 0 1 5 0V15a2 2 0 0 1-4 0v-3.5"/>
+            <path d="M11 10a2 2 0 0 1 4 0v4"/>
+            <path d="M14 11a2 2 0 0 1 4 0v3"/>
+            <circle cx="12" cy="12" r="3" fill="currentColor"/>
+          </svg>
+        </div>
+        <div class="brand-info">
+          <h1>OmniSign AI</h1>
+          <p class="tagline">Multimodal ISL &bull; ASL &bull; Speech-to-Text System</p>
+        </div>
+      </div>
+
+      <!-- Global Controls / Status Bar -->
+      <div class="header-controls">
+        <div class="status-badge" id="system-status-badge">
+          <span class="status-dot"></span>
+          <span id="system-status-text">Connecting...</span>
+        </div>
+        <button id="btn-settings-toggle" class="icon-btn" title="System Settings">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Workspace Grid -->
+    <main class="workspace-grid">
+      <!-- Left Column: Camera Feed & Recognition Panel -->
+      <section class="card vision-panel">
+        <div class="card-header">
+          <div class="panel-title">
+            <span class="icon">📹</span>
+            <h2>Sign Recognition Feed</h2>
+          </div>
+
+          <!-- Language & Mode Selectors -->
+          <div class="selectors-group">
+            <div class="custom-select-wrapper">
+              <label for="select-language">Language:</label>
+              <select id="select-language" class="styled-select">
+                <option value="ASL" selected>ASL (American Sign Language)</option>
+                <option value="ISL">ISL (Indian Sign Language)</option>
+              </select>
+            </div>
+
+            <div class="custom-select-wrapper">
+              <label for="select-mode">Mode:</label>
+              <select id="select-mode" class="styled-select">
+                <option value="ALPHABET" selected>Alphabet (Static)</option>
+                <option value="WORD">Sign / Word (Dynamic)</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- Camera Viewport with Overlay -->
+        <div class="viewport-wrapper">
+          <div class="viewport-container" id="viewport-container">
+            <video id="webcam-video" autoplay playsinline muted></video>
+            <canvas id="detection-canvas"></canvas>
+            <div class="camera-standby" id="camera-standby">
+              <div class="standby-icon">📷</div>
+              <h3>Camera Inactive</h3>
+              <p>Click "Start Camera" below to begin real-time sign recognition</p>
+            </div>
+            
+            <!-- Real-time HUD pill -->
+            <div class="live-hud" id="live-hud">
+              <span class="hud-pill hud-fps" id="hud-fps">0 FPS</span>
+              <span class="hud-pill hud-latency" id="hud-latency">0 ms</span>
+              <span class="hud-pill hud-lang" id="hud-lang">ASL &bull; ALPHABET</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Camera Control Action Bar -->
+        <div class="action-bar">
+          <div class="btn-group">
+            <button id="btn-start-camera" class="btn btn-primary">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <polygon points="5 3 19 12 5 21 5 3"/>
+              </svg>
+              Start Camera
+            </button>
+            <button id="btn-stop-camera" class="btn btn-secondary" disabled>
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="6" y="6" width="12" height="12"/>
+              </svg>
+              Stop Camera
+            </button>
+          </div>
+
+          <div class="btn-group">
+            <button id="btn-test-frame" class="btn btn-outline" title="Simulate / Run single frame snapshot">
+              Snap Frame
+            </button>
+          </div>
+        </div>
+
+        <!-- Active Detection Showcase Card -->
+        <div class="detection-showcase">
+          <div class="detection-main">
+            <div class="detection-label-group">
+              <span class="caption">Detected Sign</span>
+              <div class="big-sign-display" id="display-sign-text">--</div>
+            </div>
+
+            <div class="confidence-meter-container">
+              <div class="meter-header">
+                <span class="caption">Confidence</span>
+                <span class="confidence-val" id="confidence-percentage">0%</span>
+              </div>
+              <div class="confidence-track">
+                <div class="confidence-fill" id="confidence-fill" style="width: 0%;"></div>
+              </div>
+              <span class="threshold-marker-label" id="threshold-hint">Threshold: 55%</span>
+            </div>
+          </div>
+
+          <!-- Status Message for Uncertainty or Feedback -->
+          <div class="detection-status-banner" id="detection-status-banner">
+            <span class="status-icon" id="status-icon">💡</span>
+            <span id="detection-status-text">Position hands clearly within camera frame</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Column: Speech & Common Communication Layer -->
+      <section class="card speech-and-transcript-panel">
+        <!-- Speech Recognition Section -->
+        <div class="speech-section">
+          <div class="card-header">
+            <div class="panel-title">
+              <span class="icon">🎙️</span>
+              <h2>Speech-to-Text (Whisper ASR)</h2>
+            </div>
+            <div class="speech-status-indicator" id="speech-status-indicator">
+              <span class="mic-dot"></span>
+              <span id="speech-status-text">Microphone Ready</span>
+            </div>
+          </div>
+
+          <div class="speech-action-bar">
+            <button id="btn-start-speech" class="btn btn-speech">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                <line x1="12" y1="19" x2="12" y2="23"/>
+                <line x1="8" y1="23" x2="16" y2="23"/>
+              </svg>
+              Start Listening
+            </button>
+            <button id="btn-stop-speech" class="btn btn-secondary" disabled>
+              Stop Listening
+            </button>
+            <div class="audio-waveform-visualizer" id="waveform-visualizer">
+              <span class="wave-bar"></span>
+              <span class="wave-bar"></span>
+              <span class="wave-bar"></span>
+              <span class="wave-bar"></span>
+              <span class="wave-bar"></span>
+            </div>
+          </div>
+
+          <!-- Quick Speech Input / Test Bar -->
+          <div class="speech-quick-input">
+            <input type="text" id="input-speech-text" placeholder="Or type voice simulation text (e.g. 'Hello, how can I help you?')" />
+            <button id="btn-send-speech" class="btn btn-sm btn-outline">Send to Stream</button>
+          </div>
+        </div>
+
+        <!-- Common Communication Layer -->
+        <div class="common-layer-section">
+          <div class="card-header">
+            <div class="panel-title">
+              <span class="icon">💬</span>
+              <h2>Common Communication Layer</h2>
+            </div>
+            <div class="transcript-actions">
+              <button id="btn-speak-transcript" class="btn-sm btn-outline" title="Speak latest text via TTS">
+                🔊 Speak
+              </button>
+              <button id="btn-clear-transcript" class="btn-sm btn-outline" title="Clear transcript">
+                🗑️ Clear
+              </button>
+            </div>
+          </div>
+
+          <p class="section-desc">Unified multi-modal text stream aggregating ISL, ASL, and Speech inputs in real time.</p>
+
+          <!-- Unified Transcript Feed -->
+          <div class="transcript-feed-container" id="transcript-feed">
+            <div class="feed-empty-state" id="feed-empty-state">
+              <span class="empty-icon">🤝</span>
+              <p>No messages yet. Signs recognized or speech transcribed will appear here in chronological order.</p>
+            </div>
+          </div>
+
+          <!-- Live Composed Sentence Box -->
+          <div class="composed-sentence-box">
+            <div class="box-header">
+              <span class="caption">FULL CONVERSATION TRANSCRIPT</span>
+              <button id="btn-copy-transcript" class="copy-btn" title="Copy transcript">📋 Copy</button>
+            </div>
+            <div class="full-transcript-text" id="full-transcript-text">
+              Waiting for input...
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Settings Modal -->
+    <div class="modal-backdrop" id="settings-modal" style="display: none;">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3>System Settings & Thresholds</h3>
+          <button id="btn-close-settings" class="icon-btn">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="setting-item">
+            <label for="isl-threshold-slider">
+              ISL Confidence Threshold: <span id="isl-thresh-val">55%</span>
+            </label>
+            <input type="range" id="isl-threshold-slider" min="30" max="95" value="55" class="styled-slider">
+            <p class="setting-hint">Predictions below this confidence trigger "Sign not recognized. Please try again."</p>
+          </div>
+
+          <div class="setting-item">
+            <label for="asl-threshold-slider">
+              ASL Confidence Threshold: <span id="asl-thresh-val">50%</span>
+            </label>
+            <input type="range" id="asl-threshold-slider" min="30" max="95" value="50" class="styled-slider">
+            <p class="setting-hint">Confidence cutoff for WLASL word classifier.</p>
+          </div>
+
+          <div class="setting-item toggle-item">
+            <div>
+              <span class="toggle-title">Text-to-Speech (TTS)</span>
+              <p class="setting-hint">Speak recognized signs and speech aloud automatically</p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="tts-toggle" checked>
+              <span class="slider-round"></span>
+            </label>
+          </div>
+
+          <div class="setting-item">
+            <span class="toggle-title">Pretrained Models Summary</span>
+            <div class="model-info-table">
+              <div><strong>ISL Alphabet:</strong> Hemg/Indian-sign-language-classification</div>
+              <div><strong>ASL Word:</strong> WLASL I3D (2,000 glosses)</div>
+              <div><strong>Speech ASR:</strong> openai/whisper-base (Hugging Face)</div>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button id="btn-save-settings" class="btn btn-primary">Save & Apply</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

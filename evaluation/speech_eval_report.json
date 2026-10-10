@@ -1,0 +1,10 @@
+{
+  "model_name": "openai/whisper-base",
+  "device": "cpu",
+  "clip_duration_s": 3.0,
+  "mean_latency_ms": 0.0,
+  "median_latency_ms": 0.0,
+  "p95_latency_ms": 0.01,
+  "real_time_factor_rtf": 0.0,
+  "is_faster_than_realtime": true
+}
