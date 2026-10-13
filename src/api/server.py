@@ -42,6 +42,7 @@ from src.tts import TTSEngine
 from src.classifier import GestureClassifier
 from src.preprocessing import normalize_landmarks
 from src.recognition.video_buffer import VideoBuffer
+from src.recognition.basic_sign_detector import BasicSignDetector
 
 
 class SignLanguageAPIService:
@@ -103,8 +104,9 @@ class SignLanguageAPIService:
         )
         self.word_stabilizer = WordStabilizer(
             window=1,
-            min_confidence=0.35,
+            min_confidence=0.20,
         )
+        self.basic_sign_detector = BasicSignDetector()
 
         # TTS Engine
         try:
@@ -231,27 +233,35 @@ class SignLanguageAPIService:
                 primary_hand, all_hands, handedness = self.extractor.extract(frame)
 
             if primary_hand is not None:
-                isl_lms = (
-                    self.extractor.extract_isl_features(frame, all_hands_xyz=all_hands, handedness_labels=handedness)
-                    if self.language == "ISL" and self.extractor is not None
-                    else None
-                )
-                self.video_buffer.add(frame, landmarks=isl_lms)
-                if self.video_buffer.is_ready():
-                    sequence, landmarks = self.video_buffer.get_data()
-                    recognizer = self.asl_recognizer if self.language == "ASL" else self.isl_recognizer
-                    if self.language == "ISL":
-                        result = recognizer.predict(sequence, pose_landmarks=landmarks)
-                    else:
-                        result = recognizer.predict(sequence)
-                    label = result.label
-                    confidence = float(result.confidence)
-                    top_k = result.metadata.get("top_k", [])
-                    smoothed_label = self.word_stabilizer.update(label, confidence)
-                    self.video_buffer.clear()
+                # 1. Instant Basic Sign Detection (Geometry Classifier)
+                basic_sign, basic_conf = self.basic_sign_detector.detect(primary_hand, all_hands)
+                if basic_sign and basic_conf >= 0.85:
+                    label = basic_sign
+                    confidence = basic_conf
+                    top_k = [{"label": basic_sign, "confidence": basic_conf}]
+                    smoothed_label = self.word_stabilizer.update(basic_sign, basic_conf)
                 else:
-                    label = f"BUFFERING ({self.video_buffer.frame_count()}/32)"
-                    confidence = self.video_buffer.frame_count() / 32.0
+                    isl_lms = (
+                        self.extractor.extract_isl_features(frame, all_hands_xyz=all_hands, handedness_labels=handedness)
+                        if self.language == "ISL" and self.extractor is not None
+                        else None
+                    )
+                    self.video_buffer.add(frame, landmarks=isl_lms)
+                    if self.video_buffer.is_ready():
+                        sequence, landmarks = self.video_buffer.get_data()
+                        recognizer = self.asl_recognizer if self.language == "ASL" else self.isl_recognizer
+                        if self.language == "ISL":
+                            result = recognizer.predict(sequence, pose_landmarks=landmarks)
+                        else:
+                            result = recognizer.predict(sequence)
+                        label = result.label
+                        confidence = float(result.confidence)
+                        top_k = result.metadata.get("top_k", [])
+                        smoothed_label = self.word_stabilizer.update(label, confidence)
+                        self.video_buffer.clear()
+                    else:
+                        label = f"BUFFERING ({self.video_buffer.frame_count()}/32)"
+                        confidence = self.video_buffer.frame_count() / 32.0
             else:
                 self.word_stabilizer.mark_released()
                 if self.video_buffer.frame_count() >= 8:
@@ -416,7 +426,7 @@ class APIRequestHandler(SimpleHTTPRequestHandler):
             self._send_json({"error": "Endpoint not found"}, status=404)
 
 
-def run_server(host: str = "127.0.0.1", port: int = 8000) -> None:
+def run_server(host: str = "127.0.0.1", port: int = 8000, open_browser: bool = True) -> None:
     """Start the REST API and frontend server."""
     server_address = (host, port)
     httpd = HTTPServer(server_address, APIRequestHandler)
@@ -424,6 +434,11 @@ def run_server(host: str = "127.0.0.1", port: int = 8000) -> None:
     print(f"  AI Sign Language & Speech-to-Text Web Server")
     print(f"  Open in Browser: http://{host}:{port}")
     print(f"=======================================================\n")
+    if open_browser:
+        import threading
+        import webbrowser
+
+        threading.Timer(1.0, lambda: webbrowser.open(f"http://{host}:{port}")).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

@@ -47,16 +47,36 @@ class LandmarkExtractor:
                 "Ensure models/hand_landmarker.task is downloaded."
             )
 
-        base_options = mp_python.BaseOptions(model_asset_path=str(model_file))
-        options = mp_vision.HandLandmarkerOptions(
-            base_options=base_options,
-            num_hands=num_hands,
-            min_hand_detection_confidence=min_hand_detection_confidence,
-            min_hand_presence_confidence=min_hand_presence_confidence,
-            min_tracking_confidence=min_tracking_confidence,
-            running_mode=mp_vision.RunningMode.IMAGE,
-        )
-        self.detector = mp_vision.HandLandmarker.create_from_options(options)
+        self.detector = None
+        self._legacy_hands = None
+
+        # Try Tasks API with memory buffer
+        try:
+            with open(model_file, "rb") as f:
+                model_data = f.read()
+            base_options = mp_python.BaseOptions(model_asset_buffer=model_data)
+            options = mp_vision.HandLandmarkerOptions(
+                base_options=base_options,
+                num_hands=num_hands,
+                min_hand_detection_confidence=min_hand_detection_confidence,
+                min_hand_presence_confidence=min_hand_presence_confidence,
+                min_tracking_confidence=min_tracking_confidence,
+                running_mode=mp_vision.RunningMode.IMAGE,
+            )
+            self.detector = mp_vision.HandLandmarker.create_from_options(options)
+        except Exception as exc:
+            print(f"[LandmarkExtractor] Tasks API init notice: {exc}")
+
+        # Always initialize legacy solutions.hands as a robust fallback
+        try:
+            self._legacy_hands = mp.solutions.hands.Hands(
+                static_image_mode=False,
+                max_num_hands=num_hands,
+                min_detection_confidence=min_hand_detection_confidence,
+                min_tracking_confidence=min_tracking_confidence,
+            )
+        except Exception as exc:
+            print(f"[LandmarkExtractor] Legacy hands init notice: {exc}")
 
     def extract(
         self, bgr_frame: np.ndarray
@@ -78,15 +98,19 @@ class LandmarkExtractor:
         if bgr_frame is None or bgr_frame.size == 0:
             return None, [], []
 
-        rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-
-        detection_result = self.detector.detect(mp_image)
-
+        rgb_frame = np.ascontiguousarray(cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB))
         all_hands_xyz: List[np.ndarray] = []
         handedness_labels: List[str] = []
 
-        if detection_result.hand_landmarks:
+        detection_result = None
+        if self.detector is not None:
+            try:
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                detection_result = self.detector.detect(mp_image)
+            except Exception:
+                detection_result = None
+
+        if detection_result and detection_result.hand_landmarks:
             for hand_idx, landmarks in enumerate(detection_result.hand_landmarks):
                 coords = np.zeros((21, 3), dtype=np.float32)
                 for i, lm in enumerate(landmarks):
@@ -95,7 +119,6 @@ class LandmarkExtractor:
                     coords[i, 2] = lm.z
                 all_hands_xyz.append(coords)
 
-                # Determine handedness label if available
                 label = "Hand"
                 if (
                     detection_result.handedness
@@ -104,6 +127,28 @@ class LandmarkExtractor:
                 ):
                     label = detection_result.handedness[hand_idx][0].category_name
                 handedness_labels.append(label)
+        elif self._legacy_hands is not None:
+            try:
+                legacy_res = self._legacy_hands.process(rgb_frame)
+                if legacy_res and legacy_res.multi_hand_landmarks:
+                    for hand_idx, landmarks in enumerate(legacy_res.multi_hand_landmarks):
+                        coords = np.zeros((21, 3), dtype=np.float32)
+                        for i, lm in enumerate(landmarks.landmark):
+                            coords[i, 0] = lm.x
+                            coords[i, 1] = lm.y
+                            coords[i, 2] = lm.z
+                        all_hands_xyz.append(coords)
+
+                        label = "Hand"
+                        if (
+                            legacy_res.multi_handedness
+                            and hand_idx < len(legacy_res.multi_handedness)
+                            and legacy_res.multi_handedness[hand_idx].classification
+                        ):
+                            label = legacy_res.multi_handedness[hand_idx].classification[0].label
+                        handedness_labels.append(label)
+            except Exception:
+                pass
 
         primary_hand = all_hands_xyz[0] if all_hands_xyz else None
         return primary_hand, all_hands_xyz, handedness_labels

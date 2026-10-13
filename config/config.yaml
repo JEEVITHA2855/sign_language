@@ -27,20 +27,20 @@ recognition:
   max_sign_frames: 64
   movement_threshold: 0.015
   pause_frames: 8
-  word_stabilizer_window: 2
-  word_min_confidence: 0.40
+  word_stabilizer_window: 1
+  word_min_confidence: 0.20
 
 # Confidence Thresholds (Configurable per language)
 thresholds:
-  isl: 0.55 # Configurable cutoff for ISL alphabet/word recognition
-  asl: 0.50 # Configurable cutoff for ASL recognition
+  isl: 0.25 # Configurable cutoff for ISL alphabet/word recognition
+  asl: 0.20 # Configurable cutoff for ASL recognition
   uncertain_message: "Sign not recognized. Please try again."
 
 # ISL Model Configuration (Hugging Face)
 isl:
   alphabet_model: "Hemg/Indian-sign-language-classification"
   device: "auto"
-  confidence_threshold: 0.50
+  confidence_threshold: 0.25
   word_model:
     provider: huggingface
     model_id: "Abs6187/isl-models"
@@ -50,7 +50,7 @@ isl:
     enabled: true
     device: "auto"
     num_frames: 30
-    confidence_threshold: 0.50
+    confidence_threshold: 0.25
 
 # Speech-to-Text Configuration (Whisper)
 speech:

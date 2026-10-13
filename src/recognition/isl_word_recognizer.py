@@ -33,7 +33,7 @@ class ISLWordRecognizer(BaseSignRecognizer):
         checkpoint_name: str = "best_model_new.pth",
         metadata_name: str = "metadata.json",
         model_dir: Optional[str] = "models/isl",
-        confidence_threshold: float = 0.50,
+        confidence_threshold: float = 0.25,
         device: str = "auto",
         use_hierarchical: bool = True,
         enabled: bool = True,
@@ -101,8 +101,8 @@ class ISLWordRecognizer(BaseSignRecognizer):
         top_k = res.get("top_k", [])
         inference_ms = float(res.get("inference_ms", 0.0))
 
-        # Check confidence against threshold
-        if raw_conf < self.confidence_threshold:
+        # Check confidence against threshold (cutoff at 0.15 for UNCERTAIN)
+        if raw_conf < 0.15:
             display_label = "UNCERTAIN"
         else:
             display_label = raw_label

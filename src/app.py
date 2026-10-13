@@ -31,7 +31,28 @@ from src.recognition.sign_segmenter import SignSegmenter
 from src.recognition.video_buffer import VideoBuffer
 from src.recognition.word_buffer import WordBuffer
 from src.recognition.word_stabilizer import WordStabilizer
+from src.recognition.basic_sign_detector import BasicSignDetector
 from src.communication.common_text_layer import CommonTextLayer
+
+# Universal Basic Signs & Dynamic Words Action Guide
+BASIC_WORD_ACTIONS = {
+    "HELLO": ("Open Palm", "Raise flat open hand facing camera to greet"),
+    "YES": ("Thumbs Up", "Extend thumb upright with fist to agree"),
+    "NO": ("Thumbs Down", "Point thumb downward with fist to disagree"),
+    "I LOVE YOU": ("ILY Sign", "Thumb, index & pinky upright (curl middle 2)"),
+    "PEACE": ("Peace / Two", "Extend index and middle in a V shape"),
+    "OK": ("OK Sign", "Touch thumb and index tips, extend other 3"),
+    "THANK YOU": ("Praying / Chest", "Join both hands or push flat palm forward"),
+    "YOU": ("Point Finger", "Point index finger forward at partner"),
+    "CALL ME": ("Phone / Shaka", "Extend thumb and pinky outward"),
+    "STOP": ("Closed Fist", "Hold firm closed fist facing forward"),
+    "HOSPITAL": ("ISL Hospital", "Cross fingers or tap upper arm"),
+    "DOCTOR": ("ISL Doctor", "Tap two fingers on wrist pulse"),
+    "HOW_ARE_YOU_": ("ISL How Are You", "Open hands turning upward toward partner"),
+    "HELP": ("ASL Help", "Place thumbs up fist on open flat palm"),
+    "HAPPY": ("ISL Happy", "Sweep flat hand upward across chest"),
+    "MONDAY": ("ISL Monday", "Circular M gesture in the air"),
+}
 
 # Complete ASL Alphabet Hand Action and Posture Guide
 ALPHABET_ACTIONS = {
@@ -158,8 +179,9 @@ class SignLanguageApp:
         )
         self.word_stabilizer = WordStabilizer(
             window=recognition_cfg.get("word_stabilizer_window", 1),
-            min_confidence=recognition_cfg.get("word_min_confidence", 0.35),
+            min_confidence=recognition_cfg.get("word_min_confidence", 0.20),
         )
+        self.basic_sign_detector = BasicSignDetector()
         self.word_buffer = WordBuffer()
         self._previous_hand = None
         self.word_prediction = "NONE"
@@ -238,13 +260,24 @@ class SignLanguageApp:
         all_hands: Optional[List[np.ndarray]] = None,
         handedness: Optional[List[str]] = None,
     ) -> None:
-        if primary_hand is None:
-            movement = 0.0
-            hand_confidence = 0.0
-            # Hand left frame: mark release so identical subsequent words can be accepted
-            self.word_stabilizer.mark_released()
+        # 1. Instant Basic Sign Detection (Geometric Landmark Classifier)
+        if primary_hand is not None:
+            basic_sign, basic_conf = self.basic_sign_detector.detect(primary_hand, all_hands)
+            if basic_sign and basic_conf >= 0.85:
+                self.word_prediction = basic_sign
+                self.word_confidence = basic_conf
+                committed = self.word_stabilizer.update(basic_sign, basic_conf)
+                if committed:
+                    self.word_buffer.add_word(committed)
+                    self.common_layer.add_entry(committed, source="BASIC_SIGN", mode="WORD", confidence=basic_conf)
+                    self.set_status(f"Confirmed basic sign: [{committed}]")
+                    if self.tts.enabled:
+                        self.tts.speak_token(committed, is_completed_word=True, is_sentence=False)
+                return
 
-            # If user had started signing and now removed hand, finalize gesture:
+        # 2. Dynamic Video Sign Recognition (ISL Transformer / ASL I3D)
+        if primary_hand is None:
+            self.word_stabilizer.mark_released()
             if self.video_buffer.frame_count() >= self.video_buffer.min_frames:
                 sequence, landmarks = self.video_buffer.get_data()
                 if self.video_buffer.is_ready():
@@ -256,36 +289,25 @@ class SignLanguageApp:
                     self.word_confidence = result.confidence
                     self.word_inference_ms = float(result.metadata.get("inference_ms", 0.0))
                     accepted = self.word_stabilizer.update(result.label, result.confidence)
-                    if accepted:
+                    if accepted and accepted not in ("NONE", "UNCERTAIN", "UNKNOWN", "MODEL_UNAVAILABLE"):
                         self.word_buffer.add_word(accepted)
                         self.common_layer.add_entry(accepted, source=self.language, mode="WORD", confidence=self.word_confidence)
                         self.set_status(f"Confirmed word: [{accepted}]")
-                        if self.tts.mode == "word":
+                        if self.tts.enabled:
                             self.tts.speak_token(accepted, is_completed_word=True, is_sentence=False)
                 self.video_buffer.clear()
-                self.sign_segmenter.reset()
                 self._previous_hand = None
                 return
         else:
-            if self._previous_hand is None:
-                # A held static sign has no inter-frame movement; hand appearance
-                # itself is the segment onset signal.
-                movement = self.sign_segmenter.movement_threshold
-            else:
-                movement = float(np.mean(np.linalg.norm(primary_hand - self._previous_hand, axis=1)))
-            hand_confidence = 1.0
-            self._previous_hand = primary_hand.copy()
-
-        event = self.sign_segmenter.update(movement, hand_confidence, time.time())
-        if event in {"SIGN_STARTED", "SIGNING"} and primary_hand is not None:
+            # Add frame and landmarks into video buffer while hand is active
             isl_lms = None
             if self.language == "ISL" and self.extractor is not None:
                 isl_lms = self.extractor.extract_isl_features(frame, all_hands_xyz=all_hands, handedness_labels=handedness)
             self.video_buffer.add(frame, landmarks=isl_lms)
 
-        if event == "SIGN_ENDED":
-            sequence, landmarks = self.video_buffer.get_data()
-            if self.video_buffer.is_ready():
+            # Auto-predict if video buffer is full (32 frames reached)
+            if self.video_buffer.frame_count() >= self.video_buffer.sequence_length:
+                sequence, landmarks = self.video_buffer.get_data()
                 if self.language == "ISL":
                     result = self._word_recognizer().predict(sequence, pose_landmarks=landmarks)
                 else:
@@ -294,15 +316,13 @@ class SignLanguageApp:
                 self.word_confidence = result.confidence
                 self.word_inference_ms = float(result.metadata.get("inference_ms", 0.0))
                 accepted = self.word_stabilizer.update(result.label, result.confidence)
-                if accepted:
+                if accepted and accepted not in ("NONE", "UNCERTAIN", "UNKNOWN", "MODEL_UNAVAILABLE"):
                     self.word_buffer.add_word(accepted)
                     self.common_layer.add_entry(accepted, source=self.language, mode="WORD", confidence=self.word_confidence)
                     self.set_status(f"Confirmed word: [{accepted}]")
-                    if self.tts.mode == "word":
+                    if self.tts.enabled:
                         self.tts.speak_token(accepted, is_completed_word=True, is_sentence=False)
-            self.video_buffer.clear()
-            self.sign_segmenter.reset()
-            self._previous_hand = None
+                self.video_buffer.clear()
 
     def trigger_ai_retransform(
         self,
@@ -565,12 +585,13 @@ class SignLanguageApp:
 
         # Sidebar Header
         cv2.rectangle(canvas, (sx, 0), (sx + sw, 42), (24, 24, 30), -1)
+        header_title = f"{self.language} WORD & BASIC SIGNS" if self._active_pipeline() == "WORD" else f"{self.language} ALPHABET GUIDE"
         cv2.putText(
             canvas,
-            "ASL ALPHABET & ACTION GUIDE",
+            header_title,
             (sx + 16, 28),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.56,
+            0.54,
             (0, 220, 255),
             2,
             cv2.LINE_AA,
@@ -581,13 +602,17 @@ class SignLanguageApp:
         cv2.rectangle(canvas, (sx + 10, cy), (sx + sw - 10, cy + 85), (28, 28, 36), -1)
         cv2.rectangle(canvas, (sx + 10, cy), (sx + sw - 10, cy + 85), (60, 60, 75), 1)
 
-        disp_sign = active_label if active_label != "NONE" else "--"
-        sign_col = (0, 255, 180) if confidence >= 0.75 else (0, 180, 255)
+        disp_sign = active_label if active_label not in ("NONE", "UNKNOWN", "UNCERTAIN") else "--"
+        sign_col = (0, 255, 180) if confidence >= 0.65 else (0, 180, 255)
         cv2.putText(canvas, "ACTIVE DETECTED SIGN", (sx + 20, cy + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (160, 160, 170), 1)
-        cv2.putText(canvas, disp_sign, (sx + 20, cy + 48), cv2.FONT_HERSHEY_DUPLEX, 0.95, sign_col, 2, cv2.LINE_AA)
+        cv2.putText(canvas, disp_sign[:14], (sx + 20, cy + 48), cv2.FONT_HERSHEY_DUPLEX, 0.85, sign_col, 2, cv2.LINE_AA)
 
         # Retrieve action description for active sign
-        action_info = ALPHABET_ACTIONS.get(active_label, ("Resting hand", "Show an ASL alphabet sign to the camera"))
+        if self._active_pipeline() == "WORD":
+            action_info = BASIC_WORD_ACTIONS.get(active_label, (active_label, f"Recognized sign in {self.language} vocabulary"))
+        else:
+            action_info = ALPHABET_ACTIONS.get(active_label, ("Resting hand", "Show an ASL alphabet sign to the camera"))
+
         cv2.putText(canvas, f"Action: {action_info[0]}", (sx + 85, cy + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 240, 220), 1)
         cv2.putText(canvas, f"{action_info[1][:42]}", (sx + 85, cy + 56), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (170, 170, 180), 1)
 
@@ -595,55 +620,72 @@ class SignLanguageApp:
         bar_x, bar_y, bar_w, bar_h = sx + 20, cy + 68, sw - 80, 8
         cv2.rectangle(canvas, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (45, 45, 50), -1)
         fill_w = int(bar_w * np.clip(confidence, 0.0, 1.0))
-        bar_col = (0, 240, 120) if confidence >= 0.75 else ((0, 180, 255) if confidence >= 0.50 else (0, 70, 255))
+        bar_col = (0, 240, 120) if confidence >= 0.70 else ((0, 180, 255) if confidence >= 0.40 else (0, 70, 255))
         cv2.rectangle(canvas, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), bar_col, -1)
         cv2.putText(canvas, f"{confidence * 100:.0f}%", (bar_x + bar_w + 6, bar_y + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
 
         # Section 1: Keyboard Controls & Shortcuts
         cy = 145
-        cv2.putText(canvas, f"KEYBOARD CONTROLS [{self.language} | {self._active_pipeline()}]", (sx + 14, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 240, 255), 1)
+        cv2.putText(canvas, f"CONTROLS [{self.language} | {self._active_pipeline()}]", (sx + 14, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 240, 255), 1)
         shortcuts = [
-            ("[1 / 2]", f"Mode: [1] Alphabet, [2] Word ({self._active_pipeline()})"),
-            ("[L]", f"Language: Toggle ISL / ASL (Active: {self.language})"),
-            ("[G/H]", "AI Reconstruct Sentence (Hugging Face)"),
-            ("[S]", "Speak Fluent Sentence via TTS"),
-            ("[M]", f"Cycle TTS Mode ({self.tts.mode.upper()})"),
-            ("[SPACE]", "Pause / Resume Stream"),
-            ("[BKSP]", "Delete Last Sign / Letter"),
-            ("[C]", "Clear All Buffers"),
-            ("[T]", "Cycle Translation Language"),
+            ("[1]", "Alphabet Mode (Fingerspelling A-Z)"),
+            ("[2]", f"Word Mode (Basic Signs + {self.language} Words)"),
+            ("[L]", f"Toggle Language (Active: {self.language})"),
+            ("[G]", "AI Reconstruct Sentence (Flan-T5 / HF)"),
+            ("[S]", "Speak Sentence via TTS"),
+            ("[C]", "Clear All Text / Buffers"),
             ("[Q]", "Quit Application"),
         ]
         sc_y = cy + 18
         for key, desc in shortcuts:
-            cv2.putText(canvas, f"{key:<8} : {desc}", (sx + 16, sc_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (190, 190, 200), 1)
-            sc_y += 15
+            cv2.putText(canvas, f"{key:<6} : {desc}", (sx + 16, sc_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (190, 190, 200), 1)
+            sc_y += 16
 
-        # Section 2: Alphabet Quick Reference Grid (A–Z, SPACE, DEL)
-        cy = 295
-        cv2.putText(canvas, "ASL ALPHABET GRID (A-Z, SPACE, DEL)", (sx + 14, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 240, 255), 1)
+        # Section 2: Reference Guide (Alphabet Grid vs Basic Signs)
+        cy = 280
+        if self._active_pipeline() == "WORD":
+            cv2.putText(canvas, "BASIC SIGNS (HEURISTIC & NEURAL)", (sx + 14, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 240, 255), 1)
+            basic_list = [
+                ("HELLO", "Open palm facing camera"),
+                ("YES", "Thumbs up with fist"),
+                ("NO", "Thumbs down with fist"),
+                ("I LOVE YOU", "Thumb + index + pinky up"),
+                ("PEACE", "Index & middle up (V sign)"),
+                ("OK", "Thumb & index ring, 3 up"),
+                ("THANK YOU", "Namaste / palm forward"),
+                ("DOCTOR/HOSPITAL", "Dynamic ISL body sign"),
+            ]
+            by_pos = cy + 18
+            for sname, sdesc in basic_list:
+                is_active = (active_label == sname)
+                tcol = (0, 255, 180) if is_active else (200, 200, 210)
+                prefix = ">" if is_active else "*"
+                cv2.putText(canvas, f"{prefix} {sname:<12} : {sdesc[:24]}", (sx + 16, by_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.34, tcol, 1)
+                by_pos += 15
+        else:
+            cv2.putText(canvas, "ASL ALPHABET GRID (A-Z, SPACE, DEL)", (sx + 14, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 240, 255), 1)
 
-        grid_start_x = sx + 14
-        grid_start_y = cy + 20
-        cell_w, cell_h = 26, 22
+            grid_start_x = sx + 14
+            grid_start_y = cy + 20
+            cell_w, cell_h = 26, 22
 
-        for idx, letter in enumerate(ALPHABET_GRID):
-            row = idx // 14
-            col = idx % 14
-            bx = grid_start_x + col * cell_w
-            by = grid_start_y + row * cell_h
+            for idx, letter in enumerate(ALPHABET_GRID):
+                row = idx // 14
+                col = idx % 14
+                bx = grid_start_x + col * cell_w
+                by = grid_start_y + row * cell_h
 
-            is_letter_active = (active_label == letter)
-            if is_letter_active:
-                cv2.rectangle(canvas, (bx, by - 15), (bx + cell_w - 3, by + 5), (0, 255, 180), -1)
-                l_color = (0, 0, 0)
-            else:
-                cv2.rectangle(canvas, (bx, by - 15), (bx + cell_w - 3, by + 5), (32, 32, 40), -1)
-                cv2.rectangle(canvas, (bx, by - 15), (bx + cell_w - 3, by + 5), (55, 55, 65), 1)
-                l_color = (190, 190, 200)
+                is_letter_active = (active_label == letter)
+                if is_letter_active:
+                    cv2.rectangle(canvas, (bx, by - 15), (bx + cell_w - 3, by + 5), (0, 255, 180), -1)
+                    l_color = (0, 0, 0)
+                else:
+                    cv2.rectangle(canvas, (bx, by - 15), (bx + cell_w - 3, by + 5), (32, 32, 40), -1)
+                    cv2.rectangle(canvas, (bx, by - 15), (bx + cell_w - 3, by + 5), (55, 55, 65), 1)
+                    l_color = (190, 190, 200)
 
-            disp_l = letter[:2] if len(letter) > 1 else letter
-            cv2.putText(canvas, disp_l, (bx + 3, by), cv2.FONT_HERSHEY_SIMPLEX, 0.36, l_color, 1)
+                disp_l = letter[:2] if len(letter) > 1 else letter
+                cv2.putText(canvas, disp_l, (bx + 3, by), cv2.FONT_HERSHEY_SIMPLEX, 0.36, l_color, 1)
 
         # Section 3: Alphabet Action Inspector Box
         cy = 360
