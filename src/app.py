@@ -27,6 +27,7 @@ from src.nlp.huggingface_corrector import HuggingFaceCorrector
 from src.nlp.translation import translate_sentence
 from src.recognition.asl_recognizer import ASLRecognizer
 from src.recognition.isl_recognizer import ISLRecognizer
+from src.recognition.isl_word_recognizer import ISLWordRecognizer
 from src.recognition.sign_segmenter import SignSegmenter
 from src.recognition.video_buffer import VideoBuffer
 from src.recognition.word_buffer import WordBuffer
@@ -99,6 +100,7 @@ class SignLanguageApp:
         mock_mode: bool = False,
         disable_tts: bool = False,
         mode_override: Optional[str] = None,
+        language_override: Optional[str] = None,
     ) -> None:
         self.config_path = Path(config_path)
         with open(self.config_path, "r", encoding="utf-8") as f:
@@ -109,9 +111,25 @@ class SignLanguageApp:
 
         self.labels = self.cfg.get("labels", [])
         recognition_cfg = self.cfg.get("recognition", {})
-        requested_mode = str(mode_override or recognition_cfg.get("mode", "FINGERSPELLING")).upper()
-        self.mode = requested_mode if requested_mode in {"WORD", "FINGERSPELLING", "AUTO"} else "FINGERSPELLING"
-        self.language = str(recognition_cfg.get("language", "ASL")).upper()
+        raw_mode = str(mode_override or recognition_cfg.get("mode", "FINGERSPELLING")).upper()
+        raw_lang = str(language_override or recognition_cfg.get("language", "ASL")).upper()
+
+        if raw_mode in ("ISL_WORD", "ISL"):
+            self.mode = "WORD"
+            self.language = "ISL"
+        elif raw_mode in ("ASL_WORD", "ASL"):
+            self.mode = "WORD"
+            self.language = "ASL"
+        elif raw_mode in ("ALPHABET", "FINGERSPELLING"):
+            self.mode = "FINGERSPELLING"
+            self.language = raw_lang
+        elif raw_mode in ("WORD", "AUTO"):
+            self.mode = raw_mode
+            self.language = raw_lang
+        else:
+            self.mode = "FINGERSPELLING"
+            self.language = raw_lang
+
         stab_cfg = self.cfg.get("stabilizer", {})
         tts_cfg = self.cfg.get("tts", {})
         nlp_cfg = self.cfg.get("nlp", {})
@@ -122,6 +140,7 @@ class SignLanguageApp:
         print("=" * 68)
         print(f"  Camera Index   : {cam_idx} (Mock Mode: {mock_mode})")
         print(f"  Vocabulary     : {len(self.labels)} classes (A-Z + SPACE + DEL)")
+        print(f"  Active Mode    : {self.mode} [{self.language}]")
         print(f"  TTS Mode       : {tts_cfg.get('mode', 'sentence').upper()} (Enabled: {not disable_tts})")
         print(f"  Gemini AI      : {gem_cfg.get('model', 'gemini-1.5-flash')} (Auto: {gem_cfg.get('auto_trigger_on_finish', True)})")
         print("=" * 68 + "\n")
@@ -165,11 +184,35 @@ class SignLanguageApp:
             labels_path=model_paths.get("asl_labels"),
         )
         self.isl_recognizer = ISLRecognizer(enabled=True)
+
+        isl_cfg = self.cfg.get("isl", {})
+        isl_word_cfg = isl_cfg.get("word_model", {})
+        isl_threshold = isl_word_cfg.get(
+            "confidence_threshold", self.cfg.get("thresholds", {}).get("isl", 0.25)
+        )
+        try:
+            self.isl_word_recognizer = ISLWordRecognizer(
+                model_id=isl_word_cfg.get("model_id", "Abs6187/isl-models"),
+                checkpoint_name=isl_word_cfg.get("checkpoint", "best_model_new.pth"),
+                metadata_name=isl_word_cfg.get("metadata", "metadata.json"),
+                model_dir=str(PROJECT_ROOT / "models" / "isl"),
+                confidence_threshold=isl_threshold,
+                device=isl_word_cfg.get("device", "auto"),
+                use_hierarchical=isl_word_cfg.get("hierarchical", True),
+                enabled=True,
+            )
+        except Exception as exc:
+            print(f"[SignLanguageApp] ISL Word Recognizer init notice: {exc}")
+            self.isl_word_recognizer = None
+
+        if self.language == "ISL" and self.mode == "WORD":
+            self.isl_recognizer.set_mode("WORD")
+
         self.video_buffer = VideoBuffer(
             max_frames=recognition_cfg.get("max_frames", 64),
             target_fps=recognition_cfg.get("target_fps", 15),
             min_frames=recognition_cfg.get("min_frames", 8),
-            sequence_length=recognition_cfg.get("sequence_length", 32),
+            sequence_length=recognition_cfg.get("sequence_length", 30),
         )
         self.sign_segmenter = SignSegmenter(
             min_sign_frames=recognition_cfg.get("min_sign_frames", 8),
@@ -187,6 +230,8 @@ class SignLanguageApp:
         self.word_prediction = "NONE"
         self.word_confidence = 0.0
         self.word_inference_ms = 0.0
+        self.word_top_k: List[Dict[str, Any]] = []
+        self.word_diagnostics: Dict[str, Any] = {}
         self.word_model_status = (
             "LOADED" if self._word_recognizer().is_loaded() else "NOT AVAILABLE"
         )
@@ -251,7 +296,12 @@ class SignLanguageApp:
         return self.mode
 
     def _word_recognizer(self):
-        return self.asl_recognizer if self.language == "ASL" else self.isl_recognizer
+        if self.language == "ISL":
+            if self.isl_word_recognizer is not None and self.isl_word_recognizer.is_loaded():
+                return self.isl_word_recognizer
+            self.isl_recognizer.set_mode("WORD")
+            return self.isl_recognizer
+        return self.asl_recognizer
 
     def _process_word_frame(
         self,
@@ -260,8 +310,8 @@ class SignLanguageApp:
         all_hands: Optional[List[np.ndarray]] = None,
         handedness: Optional[List[str]] = None,
     ) -> None:
-        # 1. Instant Basic Sign Detection (Geometric Landmark Classifier)
-        if primary_hand is not None:
+        # 1. Instant Basic Sign Detection (Geometric Landmark Classifier) - ASL only
+        if self.language == "ASL" and primary_hand is not None:
             basic_sign, basic_conf = self.basic_sign_detector.detect(primary_hand, all_hands)
             if basic_sign and basic_conf >= 0.85:
                 self.word_prediction = basic_sign
@@ -269,13 +319,17 @@ class SignLanguageApp:
                 committed = self.word_stabilizer.update(basic_sign, basic_conf)
                 if committed:
                     self.word_buffer.add_word(committed)
-                    self.common_layer.add_entry(committed, source="BASIC_SIGN", mode="WORD", confidence=basic_conf)
+                    self.common_layer.add_entry(
+                        committed, source="BASIC_SIGN", mode="WORD", confidence=basic_conf
+                    )
                     self.set_status(f"Confirmed basic sign: [{committed}]")
                     if self.tts.enabled:
                         self.tts.speak_token(committed, is_completed_word=True, is_sentence=False)
                 return
 
         # 2. Dynamic Video Sign Recognition (ISL Transformer / ASL I3D)
+        target_seq_len = 30 if self.language == "ISL" else self.video_buffer.sequence_length
+
         if primary_hand is None:
             self.word_stabilizer.mark_released()
             if self.video_buffer.frame_count() >= self.video_buffer.min_frames:
@@ -288,11 +342,19 @@ class SignLanguageApp:
                     self.word_prediction = result.label
                     self.word_confidence = result.confidence
                     self.word_inference_ms = float(result.metadata.get("inference_ms", 0.0))
+                    self.word_top_k = result.metadata.get("top_k", [])
+                    self.word_diagnostics = result.metadata.get("diagnostics", {})
                     accepted = self.word_stabilizer.update(result.label, result.confidence)
                     if accepted and accepted not in ("NONE", "UNCERTAIN", "UNKNOWN", "MODEL_UNAVAILABLE"):
                         self.word_buffer.add_word(accepted)
-                        self.common_layer.add_entry(accepted, source=self.language, mode="WORD", confidence=self.word_confidence)
-                        self.set_status(f"Confirmed word: [{accepted}]")
+                        self.common_layer.add_entry(
+                            accepted,
+                            source=self.language,
+                            mode="WORD",
+                            confidence=self.word_confidence,
+                            metadata=result.metadata,
+                        )
+                        self.set_status(f"Confirmed {self.language} word: [{accepted}] ({self.word_confidence:.0%})")
                         if self.tts.enabled:
                             self.tts.speak_token(accepted, is_completed_word=True, is_sentence=False)
                 self.video_buffer.clear()
@@ -305,8 +367,8 @@ class SignLanguageApp:
                 isl_lms = self.extractor.extract_isl_features(frame, all_hands_xyz=all_hands, handedness_labels=handedness)
             self.video_buffer.add(frame, landmarks=isl_lms)
 
-            # Auto-predict if video buffer is full (32 frames reached)
-            if self.video_buffer.frame_count() >= self.video_buffer.sequence_length:
+            # Auto-predict if video buffer reaches required temporal length
+            if self.video_buffer.frame_count() >= target_seq_len:
                 sequence, landmarks = self.video_buffer.get_data()
                 if self.language == "ISL":
                     result = self._word_recognizer().predict(sequence, pose_landmarks=landmarks)
@@ -315,11 +377,19 @@ class SignLanguageApp:
                 self.word_prediction = result.label
                 self.word_confidence = result.confidence
                 self.word_inference_ms = float(result.metadata.get("inference_ms", 0.0))
+                self.word_top_k = result.metadata.get("top_k", [])
+                self.word_diagnostics = result.metadata.get("diagnostics", {})
                 accepted = self.word_stabilizer.update(result.label, result.confidence)
                 if accepted and accepted not in ("NONE", "UNCERTAIN", "UNKNOWN", "MODEL_UNAVAILABLE"):
                     self.word_buffer.add_word(accepted)
-                    self.common_layer.add_entry(accepted, source=self.language, mode="WORD", confidence=self.word_confidence)
-                    self.set_status(f"Confirmed word: [{accepted}]")
+                    self.common_layer.add_entry(
+                        accepted,
+                        source=self.language,
+                        mode="WORD",
+                        confidence=self.word_confidence,
+                        metadata=result.metadata,
+                    )
+                    self.set_status(f"Confirmed {self.language} word: [{accepted}] ({self.word_confidence:.0%})")
                     if self.tts.enabled:
                         self.tts.speak_token(accepted, is_completed_word=True, is_sentence=False)
                 self.video_buffer.clear()
@@ -487,12 +557,22 @@ class SignLanguageApp:
                     self.set_status("Mode: ALPHABET (FINGERSPELLING)")
                 elif key == ord("2"):
                     self.mode = "WORD"
-                    self.set_status("Mode: WORD / SIGN (DYNAMIC)")
+                    self.language = "ISL"
+                    if self.isl_recognizer:
+                        self.isl_recognizer.set_mode("WORD")
+                    self.set_status("Mode: ISL WORD (PRETRAINED)")
                 elif key == ord("3"):
+                    self.mode = "WORD"
+                    self.language = "ASL"
+                    self.set_status("Mode: ASL WORD (DYNAMIC)")
+                elif key == ord("4"):
                     self.mode = "AUTO"
                     self.set_status(f"Mode: AUTO ({self._active_pipeline()})")
                 elif key in (ord("l"), ord("L")):
                     self.language = "ISL" if self.language == "ASL" else "ASL"
+                    if self.language == "ISL" and self.mode == "WORD":
+                        if self.isl_recognizer:
+                            self.isl_recognizer.set_mode("WORD")
                     self.set_status(f"Language: {self.language}")
                 elif key == ord(" "):  # Space to pause/resume
                     self.is_paused = not self.is_paused
@@ -629,7 +709,8 @@ class SignLanguageApp:
         cv2.putText(canvas, f"CONTROLS [{self.language} | {self._active_pipeline()}]", (sx + 14, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 240, 255), 1)
         shortcuts = [
             ("[1]", "Alphabet Mode (Fingerspelling A-Z)"),
-            ("[2]", f"Word Mode (Basic Signs + {self.language} Words)"),
+            ("[2]", "ISL Word Mode (Pretrained Dynamic ISL)"),
+            ("[3]", "ASL Word Mode (Dynamic ASL)"),
             ("[L]", f"Toggle Language (Active: {self.language})"),
             ("[G]", "AI Reconstruct Sentence (Flan-T5 / HF)"),
             ("[S]", "Speak Sentence via TTS"),
@@ -644,24 +725,36 @@ class SignLanguageApp:
         # Section 2: Reference Guide (Alphabet Grid vs Basic Signs)
         cy = 280
         if self._active_pipeline() == "WORD":
-            cv2.putText(canvas, "BASIC SIGNS (HEURISTIC & NEURAL)", (sx + 14, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 240, 255), 1)
-            basic_list = [
-                ("HELLO", "Open palm facing camera"),
-                ("YES", "Thumbs up with fist"),
-                ("NO", "Thumbs down with fist"),
-                ("I LOVE YOU", "Thumb + index + pinky up"),
-                ("PEACE", "Index & middle up (V sign)"),
-                ("OK", "Thumb & index ring, 3 up"),
-                ("THANK YOU", "Namaste / palm forward"),
-                ("DOCTOR/HOSPITAL", "Dynamic ISL body sign"),
-            ]
-            by_pos = cy + 18
-            for sname, sdesc in basic_list:
-                is_active = (active_label == sname)
-                tcol = (0, 255, 180) if is_active else (200, 200, 210)
-                prefix = ">" if is_active else "*"
-                cv2.putText(canvas, f"{prefix} {sname:<12} : {sdesc[:24]}", (sx + 16, by_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.34, tcol, 1)
-                by_pos += 15
+            if self.language == "ISL":
+                vocab = self.isl_word_recognizer.get_vocab() if self.isl_word_recognizer else []
+                cv2.putText(canvas, f"ISL VOCABULARY ({len(vocab)} SIGNS)", (sx + 14, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 240, 255), 1)
+                by_pos = cy + 18
+                display_signs = vocab[:8] if vocab else ["Hospital", "How_Are_You_", "Monday", "Night", "Shoe", "Street", "Thank You", "Yellow"]
+                for sname in display_signs:
+                    is_active = (active_label.strip().upper() == sname.strip().upper())
+                    tcol = (0, 255, 180) if is_active else (200, 200, 210)
+                    prefix = ">" if is_active else "*"
+                    cv2.putText(canvas, f"{prefix} {sname}", (sx + 16, by_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.34, tcol, 1)
+                    by_pos += 15
+            else:
+                cv2.putText(canvas, "ASL BASIC SIGNS (HEURISTIC & NEURAL)", (sx + 14, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 240, 255), 1)
+                basic_list = [
+                    ("HELLO", "Open palm facing camera"),
+                    ("YES", "Thumbs up with fist"),
+                    ("NO", "Thumbs down with fist"),
+                    ("I LOVE YOU", "Thumb + index + pinky up"),
+                    ("PEACE", "Index & middle up (V sign)"),
+                    ("OK", "Thumb & index ring, 3 up"),
+                    ("THANK YOU", "Namaste / palm forward"),
+                    ("HELP", "Thumbs up fist on palm"),
+                ]
+                by_pos = cy + 18
+                for sname, sdesc in basic_list:
+                    is_active = (active_label == sname)
+                    tcol = (0, 255, 180) if is_active else (200, 200, 210)
+                    prefix = ">" if is_active else "*"
+                    cv2.putText(canvas, f"{prefix} {sname:<12} : {sdesc[:24]}", (sx + 16, by_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.34, tcol, 1)
+                    by_pos += 15
         else:
             cv2.putText(canvas, "ASL ALPHABET GRID (A-Z, SPACE, DEL)", (sx + 14, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 240, 255), 1)
 
@@ -716,17 +809,27 @@ class SignLanguageApp:
 
         cy = 472
         cv2.putText(canvas, "RECOGNITION DEBUG PANEL", (sx + 14, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 240, 255), 1)
+        isl_status_str = (
+            f"READY ({len(self.isl_word_recognizer.get_vocab())} signs)"
+            if self.isl_word_recognizer and self.isl_word_recognizer.is_loaded()
+            else "UNAVAILABLE"
+        )
+        asl_status_str = "READY" if self.asl_recognizer.is_loaded() else "UNAVAILABLE"
+        target_seq = 30 if self.language == "ISL" else self.video_buffer.sequence_length
         debug_lines = [
-            f"Current Prediction: {active_label}",
-            f"Confidence: {confidence * 100:.0f}% (Threshold: {self.stabilizer.min_conf * 100:.0f}%)",
-            f"Stable Frames: {self.stabilizer.stable_count} / {self.stabilizer.required_stable_frames}",
-            f"Hand Detected: {'YES' if self.stabilizer.hand_detected else 'NO'}",
-            f"State: {self.stabilizer.state}",
-            f"Last Committed: {self.stabilizer.last_committed or 'NONE'}",
-            f"Recognition Mode: {self._active_pipeline()} [{self.language}]",
-            f"Buffer Frames: {self.video_buffer.frame_count()} (Segment: {self.sign_segmenter.state})",
-            f"ASL Word Model: {'READY (2000 words)' if self.asl_recognizer.is_loaded() else 'UNAVAILABLE'}",
+            f"Mode: {self._active_pipeline()} [{self.language}]",
+            f"Prediction: {active_label} ({confidence * 100:.0f}%)",
+            f"Latest Word: {self.word_buffer.get_last_word() or 'NONE'}",
+            f"Buffer Frames: {self.video_buffer.frame_count()} / {target_seq}",
+            f"Latency: {self.word_inference_ms:.1f} ms",
+            f"ISL Model: {isl_status_str}",
+            f"ASL Model: {asl_status_str}",
         ]
+        if self._active_pipeline() == "WORD" and self.word_top_k:
+            top_str = ", ".join(f"{x.get('class', '')[:7]}:{x.get('confidence', 0):.0%}" for x in self.word_top_k[:3])
+            debug_lines.append(f"Top 3: {top_str}")
+        else:
+            debug_lines.append(f"Stable Frames: {self.stabilizer.stable_count} / {self.stabilizer.required_stable_frames}")
         for line in debug_lines:
             cy += 12
             cv2.putText(canvas, line, (sx + 16, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (185, 185, 195), 1)
@@ -801,7 +904,13 @@ def main():
     parser.add_argument("--camera", type=int, default=None, help="Override camera index")
     parser.add_argument("--mock", action="store_true", help="Run with mock camera stream for headless testing")
     parser.add_argument("--no-tts", action="store_true", help="Disable voice audio synthesis")
-    parser.add_argument("--mode", choices=["WORD", "FINGERSPELLING", "AUTO"], default=None, help="Recognition pipeline mode")
+    parser.add_argument(
+        "--mode",
+        choices=["WORD", "FINGERSPELLING", "ALPHABET", "ISL_WORD", "ASL_WORD", "AUTO"],
+        default=None,
+        help="Recognition pipeline mode",
+    )
+    parser.add_argument("--language", choices=["ISL", "ASL"], default=None, help="Recognition language (ISL or ASL)")
     parser.add_argument("--frames", type=int, default=None, help="Run for N frames then exit (for automated testing)")
     args = parser.parse_args()
 
@@ -811,6 +920,7 @@ def main():
         mock_mode=args.mock,
         disable_tts=args.no_tts,
         mode_override=args.mode,
+        language_override=args.language,
     )
     app.run(max_frames=args.frames)
 

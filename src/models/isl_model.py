@@ -477,12 +477,12 @@ class SignLanguageInference:
             raise FileNotFoundError(f"ISL checkpoint not found at: {self.model_path}")
 
     def preprocess_video_frames(
-        self, frames: Union[Sequence[np.ndarray], str]
+        self, frames: Union[Sequence[np.ndarray], str, Path]
     ) -> torch.Tensor:
         """Process image frames into normalized (1, 30, 3, 128, 128) tensor."""
         # If video file path passed
-        if isinstance(frames, str):
-            cap = cv2.VideoCapture(frames)
+        if isinstance(frames, (str, Path)):
+            cap = cv2.VideoCapture(str(frames))
             raw_frames = []
             while cap.isOpened():
                 ret, f = cap.read()
@@ -562,7 +562,7 @@ class SignLanguageInference:
 
     def predict(
         self,
-        video_input: Union[Sequence[np.ndarray], str, torch.Tensor],
+        video_input: Union[Sequence[np.ndarray], str, Path, torch.Tensor],
         pose_input: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Run ISL sign recognition on temporal video sequence and pose landmarks."""
@@ -578,13 +578,38 @@ class SignLanguageInference:
 
         t0 = time.perf_counter()
 
+        raw_frames = None
         # Format input tensors
-        if isinstance(video_input, torch.Tensor) and video_input.ndim == 5:
+        if isinstance(video_input, (str, Path)):
+            cap = cv2.VideoCapture(str(video_input))
+            frames_list = []
+            while cap.isOpened():
+                ret, f = cap.read()
+                if not ret:
+                    break
+                frames_list.append(f)
+            cap.release()
+            raw_frames = frames_list
+            video_tensor = self.preprocess_video_frames(raw_frames)
+        elif isinstance(video_input, torch.Tensor) and video_input.ndim == 5:
             video_tensor = video_input.to(self.device, dtype=torch.float32)
         else:
+            raw_frames = video_input
             video_tensor = self.preprocess_video_frames(video_input)
 
+        # If pose_input omitted, attempt feature extraction from raw frames
+        if pose_input is None and raw_frames is not None and len(raw_frames) > 0:
+            try:
+                from src.landmark_extractor import LandmarkExtractor
+                extractor = LandmarkExtractor()
+                pose_input = [extractor.extract_isl_features(f) for f in raw_frames]
+                extractor.close()
+            except Exception:
+                pose_input = None
+
         pose_tensor = self.preprocess_pose_landmarks(pose_input)
+
+        diag_meta: Dict[str, Any] = {}
 
         with torch.no_grad():
             if self.gating_model is not None and self.group_models:
@@ -594,6 +619,12 @@ class SignLanguageInference:
                 best_group_idx = int(np.argmax(gate_probs))
                 group_confidence = float(gate_probs[best_group_idx])
 
+                diag_meta["gating_group"] = f"Group_{best_group_idx}"
+                diag_meta["gating_confidence"] = round(group_confidence, 4)
+                diag_meta["gating_probs"] = {
+                    f"Group_{i}": round(float(p), 4) for i, p in enumerate(gate_probs)
+                }
+
                 # Stage 2: Target group classification
                 target_model = self.group_models.get(best_group_idx)
                 target_classes = self.group_class_names.get(best_group_idx, [])
@@ -602,21 +633,22 @@ class SignLanguageInference:
                     group_logits = target_model(video_tensor, pose_tensor)
                     group_probs = F.softmax(group_logits, dim=-1).cpu().numpy()[0]
 
-                    # Scale by gating confidence
-                    combined_probs = group_probs * (0.5 + 0.5 * group_confidence)
+                    # Mathematical joint probability: P(Group) * P(Class | Group)
+                    joint_probs = group_probs * (0.5 + 0.5 * group_confidence)
 
-                    sorted_idx = np.argsort(combined_probs)[::-1]
+                    sorted_idx = np.argsort(joint_probs)[::-1]
                     top_k = [
                         {
                             "class": target_classes[i],
                             "label": target_classes[i],
-                            "confidence": round(float(combined_probs[i]), 4),
+                            "confidence": round(float(joint_probs[i]), 4),
                         }
                         for i in sorted_idx[:5]
                     ]
 
                     best_class = target_classes[sorted_idx[0]]
-                    best_conf = float(combined_probs[sorted_idx[0]])
+                    best_conf = float(joint_probs[sorted_idx[0]])
+                    diag_meta["within_group_confidence"] = round(float(group_probs[sorted_idx[0]]), 4)
                 else:
                     best_class = f"Group_{best_group_idx}"
                     best_conf = group_confidence
@@ -651,6 +683,7 @@ class SignLanguageInference:
                 "confidence": round(best_conf, 4),
             },
             "inference_ms": round(inference_ms, 1),
+            "diagnostics": diag_meta,
         }
 
 

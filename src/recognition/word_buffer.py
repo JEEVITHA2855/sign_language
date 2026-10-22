@@ -43,6 +43,10 @@ class WordBuffer:
             words.append("".join(self._current_chars))
         return words
 
+    def get_last_word(self) -> Optional[str]:
+        words = self.get_words()
+        return words[-1] if words else None
+
     def get_sentence(self) -> str:
         return " ".join(self.get_words()).strip()
 

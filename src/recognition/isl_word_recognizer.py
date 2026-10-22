@@ -79,12 +79,12 @@ class ISLWordRecognizer(BaseSignRecognizer):
 
     def predict(
         self,
-        sequence: Sequence[Any],
+        sequence: Union[Sequence[Any], str, Path],
         pose_landmarks: Optional[Any] = None,
     ) -> RecognitionResult:
-        """Run temporal sign prediction on a sequence of frames."""
-        if not self.enabled or not self.is_loaded() or not sequence:
-            reason = self.load_error or "ISL Word Recognizer not loaded or empty sequence."
+        """Run temporal sign prediction on a sequence of frames or a video path."""
+        if not self.enabled or not self.is_loaded():
+            reason = self.load_error or "ISL Word Recognizer not loaded or disabled."
             return RecognitionResult(
                 label="MODEL_UNAVAILABLE",
                 confidence=0.0,
@@ -92,7 +92,41 @@ class ISLWordRecognizer(BaseSignRecognizer):
                 mode="WORD",
                 timestamp=time.time(),
                 source="isl_unavailable",
-                metadata={"reason": reason, "top_k": []},
+                metadata={"reason": reason, "top_k": [], "inference_ms": 0.0},
+            )
+
+        if sequence is None:
+            return RecognitionResult(
+                label="UNCERTAIN",
+                confidence=0.0,
+                language="ISL",
+                mode="WORD",
+                timestamp=time.time(),
+                source="isl_empty",
+                metadata={"reason": "Empty input sequence provided.", "top_k": [], "inference_ms": 0.0},
+            )
+
+        if isinstance(sequence, (str, Path)):
+            seq_path = Path(sequence)
+            if not seq_path.exists():
+                return RecognitionResult(
+                    label="ERROR",
+                    confidence=0.0,
+                    language="ISL",
+                    mode="WORD",
+                    timestamp=time.time(),
+                    source="isl_file_not_found",
+                    metadata={"reason": f"Video file not found: {seq_path}", "top_k": [], "inference_ms": 0.0},
+                )
+        elif len(sequence) == 0:
+            return RecognitionResult(
+                label="UNCERTAIN",
+                confidence=0.0,
+                language="ISL",
+                mode="WORD",
+                timestamp=time.time(),
+                source="isl_empty",
+                metadata={"reason": "Empty frame list provided.", "top_k": [], "inference_ms": 0.0},
             )
 
         res = self.inference.predict(sequence, pose_input=pose_landmarks)
@@ -100,9 +134,10 @@ class ISLWordRecognizer(BaseSignRecognizer):
         raw_conf = float(res.get("confidence", 0.0))
         top_k = res.get("top_k", [])
         inference_ms = float(res.get("inference_ms", 0.0))
+        diagnostics = res.get("diagnostics", {})
 
-        # Check confidence against threshold (cutoff at 0.15 for UNCERTAIN)
-        if raw_conf < 0.15:
+        # Check confidence against configured threshold
+        if raw_conf < self.confidence_threshold:
             display_label = "UNCERTAIN"
         else:
             display_label = raw_label
@@ -110,10 +145,17 @@ class ISLWordRecognizer(BaseSignRecognizer):
         metadata = {
             "raw_label": raw_label,
             "raw_confidence": raw_conf,
+            "confidence_threshold": self.confidence_threshold,
             "top_k": top_k,
             "inference_ms": inference_ms,
-            "model_type": "HierarchicalTwoStreamTransformer (Abs6187/isl-models)",
+            "model_type": (
+                "HierarchicalTwoStreamTransformer (Abs6187/isl-models)"
+                if self.use_hierarchical
+                else "Monolithic (Abs6187/isl-models)"
+            ),
             "vocab_size": len(self.vocab),
+            "device": str(self.inference.device) if self.inference else self.device,
+            "diagnostics": diagnostics,
         }
 
         return RecognitionResult(

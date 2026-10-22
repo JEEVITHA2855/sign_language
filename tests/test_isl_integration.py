@@ -267,3 +267,65 @@ def test_isl_common_text_layer_duplicate_suppression():
     assert e2 is None
 
     assert ctl.entry_count == 1
+
+
+# ============================================================================
+# 7. Robustness, Edge Cases & Mode Routing Tests (Requirement 12)
+# ============================================================================
+
+def test_isl_video_file_input():
+    """Verify that a valid video file path completes inference through the recognizer."""
+    rec = ISLWordRecognizer(device="cpu", use_hierarchical=True)
+    sample_file = "samples/isl_test.mp4"
+    result = rec.predict(sample_file)
+
+    assert result is not None
+    assert result.language == "ISL"
+    assert result.mode == "WORD"
+    assert result.label != "MODEL_UNAVAILABLE"
+    assert result.confidence > 0.0
+    assert result.metadata["vocab_size"] == 28
+
+
+def test_isl_invalid_inputs_handled_gracefully():
+    """Verify that nonexistent files, empty frames, and insufficient frames do not crash."""
+    rec = ISLWordRecognizer(device="cpu", use_hierarchical=True)
+
+    # 1. Non-existent file
+    res_missing = rec.predict("samples/missing_video_12345.mp4")
+    assert res_missing.label in ("ERROR", "MODEL_UNAVAILABLE", "UNCERTAIN")
+    assert res_missing.confidence == 0.0
+
+    # 2. Empty frame list
+    res_empty = rec.predict([])
+    assert res_empty.label in ("UNCERTAIN", "MODEL_UNAVAILABLE")
+
+    # 3. None input
+    res_none = rec.predict(None)
+    assert res_none.label in ("UNCERTAIN", "MODEL_UNAVAILABLE")
+
+    # 4. Very few frames (e.g. 2 frames) - must not crash, should interpolate to 30
+    two_frames = [np.zeros((128, 128, 3), dtype=np.uint8) for _ in range(2)]
+    res_short = rec.predict(two_frames)
+    assert res_short is not None
+    assert isinstance(res_short.confidence, float)
+
+
+def test_isl_vs_asl_pipeline_routing():
+    """Verify ISL mode uses ISL vocabulary while ASL mode preserves ASL behavior."""
+    from src.recognition.asl_recognizer import ASLRecognizer
+
+    isl_rec = ISLRecognizer(mode="WORD", device="cpu")
+    asl_rec = ASLRecognizer(enabled=True)
+
+    dummy_frames = [np.zeros((128, 128, 3), dtype=np.uint8) for _ in range(30)]
+
+    isl_res = isl_rec.predict(dummy_frames)
+    assert isl_res.language == "ISL"
+    assert isl_res.mode == "WORD"
+
+    # ASL recognizer preserves ASL language attribution
+    asl_res = asl_rec.predict(dummy_frames)
+    assert asl_res.language == "ASL"
+    assert asl_res.mode == "WORD"
+
