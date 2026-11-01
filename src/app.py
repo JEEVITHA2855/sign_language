@@ -27,12 +27,14 @@ from src.nlp.huggingface_corrector import HuggingFaceCorrector
 from src.nlp.translation import translate_sentence
 from src.recognition.asl_recognizer import ASLRecognizer
 from src.recognition.isl_recognizer import ISLRecognizer
-from src.recognition.isl_word_recognizer import ISLWordRecognizer
 from src.recognition.sign_segmenter import SignSegmenter
 from src.recognition.video_buffer import VideoBuffer
 from src.recognition.word_buffer import WordBuffer
 from src.recognition.word_stabilizer import WordStabilizer
 from src.recognition.basic_sign_detector import BasicSignDetector
+from src.recognition.expanded_sign_detector import ExpandedSignDetector
+from src.recognition.sign_model_router import SignModelRouter
+from src.language.sentence_framing_engine import SentenceFramingEngine
 from src.communication.common_text_layer import CommonTextLayer
 
 # Universal Basic Signs & Dynamic Words Action Guide
@@ -100,7 +102,6 @@ class SignLanguageApp:
         mock_mode: bool = False,
         disable_tts: bool = False,
         mode_override: Optional[str] = None,
-        language_override: Optional[str] = None,
     ) -> None:
         self.config_path = Path(config_path)
         with open(self.config_path, "r", encoding="utf-8") as f:
@@ -111,25 +112,9 @@ class SignLanguageApp:
 
         self.labels = self.cfg.get("labels", [])
         recognition_cfg = self.cfg.get("recognition", {})
-        raw_mode = str(mode_override or recognition_cfg.get("mode", "FINGERSPELLING")).upper()
-        raw_lang = str(language_override or recognition_cfg.get("language", "ASL")).upper()
-
-        if raw_mode in ("ISL_WORD", "ISL"):
-            self.mode = "WORD"
-            self.language = "ISL"
-        elif raw_mode in ("ASL_WORD", "ASL"):
-            self.mode = "WORD"
-            self.language = "ASL"
-        elif raw_mode in ("ALPHABET", "FINGERSPELLING"):
-            self.mode = "FINGERSPELLING"
-            self.language = raw_lang
-        elif raw_mode in ("WORD", "AUTO"):
-            self.mode = raw_mode
-            self.language = raw_lang
-        else:
-            self.mode = "FINGERSPELLING"
-            self.language = raw_lang
-
+        requested_mode = str(mode_override or recognition_cfg.get("mode", "AUTO")).upper()
+        self.mode = requested_mode if requested_mode in {"WORD", "FINGERSPELLING", "AUTO"} else "AUTO"
+        self.language = str(recognition_cfg.get("language", "ASL")).upper()
         stab_cfg = self.cfg.get("stabilizer", {})
         tts_cfg = self.cfg.get("tts", {})
         nlp_cfg = self.cfg.get("nlp", {})
@@ -140,7 +125,6 @@ class SignLanguageApp:
         print("=" * 68)
         print(f"  Camera Index   : {cam_idx} (Mock Mode: {mock_mode})")
         print(f"  Vocabulary     : {len(self.labels)} classes (A-Z + SPACE + DEL)")
-        print(f"  Active Mode    : {self.mode} [{self.language}]")
         print(f"  TTS Mode       : {tts_cfg.get('mode', 'sentence').upper()} (Enabled: {not disable_tts})")
         print(f"  Gemini AI      : {gem_cfg.get('model', 'gemini-1.5-flash')} (Auto: {gem_cfg.get('auto_trigger_on_finish', True)})")
         print("=" * 68 + "\n")
@@ -184,35 +168,11 @@ class SignLanguageApp:
             labels_path=model_paths.get("asl_labels"),
         )
         self.isl_recognizer = ISLRecognizer(enabled=True)
-
-        isl_cfg = self.cfg.get("isl", {})
-        isl_word_cfg = isl_cfg.get("word_model", {})
-        isl_threshold = isl_word_cfg.get(
-            "confidence_threshold", self.cfg.get("thresholds", {}).get("isl", 0.25)
-        )
-        try:
-            self.isl_word_recognizer = ISLWordRecognizer(
-                model_id=isl_word_cfg.get("model_id", "Abs6187/isl-models"),
-                checkpoint_name=isl_word_cfg.get("checkpoint", "best_model_new.pth"),
-                metadata_name=isl_word_cfg.get("metadata", "metadata.json"),
-                model_dir=str(PROJECT_ROOT / "models" / "isl"),
-                confidence_threshold=isl_threshold,
-                device=isl_word_cfg.get("device", "auto"),
-                use_hierarchical=isl_word_cfg.get("hierarchical", True),
-                enabled=True,
-            )
-        except Exception as exc:
-            print(f"[SignLanguageApp] ISL Word Recognizer init notice: {exc}")
-            self.isl_word_recognizer = None
-
-        if self.language == "ISL" and self.mode == "WORD":
-            self.isl_recognizer.set_mode("WORD")
-
         self.video_buffer = VideoBuffer(
             max_frames=recognition_cfg.get("max_frames", 64),
             target_fps=recognition_cfg.get("target_fps", 15),
             min_frames=recognition_cfg.get("min_frames", 8),
-            sequence_length=recognition_cfg.get("sequence_length", 30),
+            sequence_length=recognition_cfg.get("sequence_length", 32),
         )
         self.sign_segmenter = SignSegmenter(
             min_sign_frames=recognition_cfg.get("min_sign_frames", 8),
@@ -221,8 +181,9 @@ class SignLanguageApp:
             pause_frames=recognition_cfg.get("pause_frames", 8),
         )
         self.word_stabilizer = WordStabilizer(
-            window=recognition_cfg.get("word_stabilizer_window", 1),
-            min_confidence=recognition_cfg.get("word_min_confidence", 0.20),
+            window=recognition_cfg.get("word_stabilizer_window", 7),
+            min_confidence=recognition_cfg.get("word_min_confidence", 0.82),
+            cooldown_seconds=1.0,
         )
         self.basic_sign_detector = BasicSignDetector()
         self.word_buffer = WordBuffer()
@@ -230,8 +191,8 @@ class SignLanguageApp:
         self.word_prediction = "NONE"
         self.word_confidence = 0.0
         self.word_inference_ms = 0.0
-        self.word_top_k: List[Dict[str, Any]] = []
-        self.word_diagnostics: Dict[str, Any] = {}
+        self._last_tts_time = 0.0
+        self._last_sentence_tts_time = 0.0
         self.word_model_status = (
             "LOADED" if self._word_recognizer().is_loaded() else "NOT AVAILABLE"
         )
@@ -246,10 +207,11 @@ class SignLanguageApp:
 
         composer_cfg = self.cfg.get("text_composer", {})
         self.composer = TextComposer(
-            no_hand_timeout_frames=composer_cfg.get("no_hand_timeout_frames", 45),
+            no_hand_timeout_frames=composer_cfg.get("no_hand_timeout_frames", 20),
             auto_space=composer_cfg.get("auto_space", True),
         )
         self.common_layer = CommonTextLayer(max_history=100)
+        self.sign_router = SignModelRouter(language=self.language, mode=self.mode, models_dir="models")
 
         self.tts = TTSEngine(
             enabled=(not disable_tts and tts_cfg.get("enabled", True)),
@@ -268,6 +230,7 @@ class SignLanguageApp:
             model_name=hf_model,
             enabled=True,
         )
+        self.sentence_framer = SentenceFramingEngine(corrector=self.huggingface)
 
         self.ai_auto_trigger = gem_cfg.get(
             "auto_trigger_on_finish",
@@ -291,17 +254,10 @@ class SignLanguageApp:
         self._status_time = time.time()
 
     def _active_pipeline(self) -> str:
-        if self.mode == "AUTO":
-            return "WORD" if self._word_recognizer().is_loaded() else "FINGERSPELLING"
         return self.mode
 
     def _word_recognizer(self):
-        if self.language == "ISL":
-            if self.isl_word_recognizer is not None and self.isl_word_recognizer.is_loaded():
-                return self.isl_word_recognizer
-            self.isl_recognizer.set_mode("WORD")
-            return self.isl_recognizer
-        return self.asl_recognizer
+        return self.asl_recognizer if self.language == "ASL" else self.isl_recognizer
 
     def _process_word_frame(
         self,
@@ -309,27 +265,42 @@ class SignLanguageApp:
         primary_hand: Optional[np.ndarray],
         all_hands: Optional[List[np.ndarray]] = None,
         handedness: Optional[List[str]] = None,
-    ) -> None:
-        # 1. Instant Basic Sign Detection (Geometric Landmark Classifier) - ASL only
-        if self.language == "ASL" and primary_hand is not None:
-            basic_sign, basic_conf = self.basic_sign_detector.detect(primary_hand, all_hands)
-            if basic_sign and basic_conf >= 0.85:
-                self.word_prediction = basic_sign
-                self.word_confidence = basic_conf
-                committed = self.word_stabilizer.update(basic_sign, basic_conf)
+    ) -> Optional[str]:
+        self.word_prediction = "NONE"
+        self.word_confidence = 0.0
+
+        # 1. Sign Model Router (Everyday Temporal Attention Model + Geometric Detector)
+        self.sign_router.set_language(self.language)
+        self.sign_router.set_mode(self.mode)
+
+        if primary_hand is not None or (all_hands and len(all_hands) >= 2):
+            seq_154 = None
+            if self.video_buffer.frame_count() >= 15:
+                _, landmarks = self.video_buffer.get_data()
+                if landmarks is not None and len(landmarks) > 0:
+                    seq_154 = np.array(landmarks, dtype=np.float32)
+
+            route_res = self.sign_router.route_and_predict(primary_hand, all_hands, sequence_154=seq_154)
+            if route_res.label not in ("NONE", "MODEL_UNAVAILABLE") and route_res.confidence >= self.word_stabilizer.min_confidence:
+                self.word_prediction = route_res.label
+                self.word_confidence = route_res.confidence
+                committed = self.word_stabilizer.update(route_res.label, route_res.confidence)
                 if committed:
                     self.word_buffer.add_word(committed)
-                    self.common_layer.add_entry(
-                        committed, source="BASIC_SIGN", mode="WORD", confidence=basic_conf
-                    )
-                    self.set_status(f"Confirmed basic sign: [{committed}]")
-                    if self.tts.enabled:
+                    self.sentence_framer.add_word(committed)
+                    self.composer.add_token(committed)
+                    self.common_layer.add_entry(committed, source=self.language, mode="WORD", confidence=route_res.confidence)
+                    self.set_status(f"Confirmed Word: [{committed}]")
+                    now = time.time()
+                    if self.tts.enabled and (now - self._last_tts_time) > 1.0:
+                        self._last_tts_time = now
                         self.tts.speak_token(committed, is_completed_word=True, is_sentence=False)
-                return
+                    return committed
+                return None
+            else:
+                self.word_stabilizer.update("NONE", 0.0)
 
         # 2. Dynamic Video Sign Recognition (ISL Transformer / ASL I3D)
-        target_seq_len = 30 if self.language == "ISL" else self.video_buffer.sequence_length
-
         if primary_hand is None:
             self.word_stabilizer.mark_released()
             if self.video_buffer.frame_count() >= self.video_buffer.min_frames:
@@ -342,24 +313,20 @@ class SignLanguageApp:
                     self.word_prediction = result.label
                     self.word_confidence = result.confidence
                     self.word_inference_ms = float(result.metadata.get("inference_ms", 0.0))
-                    self.word_top_k = result.metadata.get("top_k", [])
-                    self.word_diagnostics = result.metadata.get("diagnostics", {})
                     accepted = self.word_stabilizer.update(result.label, result.confidence)
                     if accepted and accepted not in ("NONE", "UNCERTAIN", "UNKNOWN", "MODEL_UNAVAILABLE"):
                         self.word_buffer.add_word(accepted)
-                        self.common_layer.add_entry(
-                            accepted,
-                            source=self.language,
-                            mode="WORD",
-                            confidence=self.word_confidence,
-                            metadata=result.metadata,
-                        )
-                        self.set_status(f"Confirmed {self.language} word: [{accepted}] ({self.word_confidence:.0%})")
-                        if self.tts.enabled:
+                        self.sentence_framer.add_word(accepted)
+                        self.composer.add_token(accepted)
+                        self.common_layer.add_entry(accepted, source=self.language, mode="WORD", confidence=self.word_confidence)
+                        self.set_status(f"Confirmed word: [{accepted}]")
+                        now = time.time()
+                        if self.tts.enabled and (now - self._last_tts_time) > 1.2:
+                            self._last_tts_time = now
                             self.tts.speak_token(accepted, is_completed_word=True, is_sentence=False)
                 self.video_buffer.clear()
                 self._previous_hand = None
-                return
+                return None
         else:
             # Add frame and landmarks into video buffer while hand is active
             isl_lms = None
@@ -367,8 +334,8 @@ class SignLanguageApp:
                 isl_lms = self.extractor.extract_isl_features(frame, all_hands_xyz=all_hands, handedness_labels=handedness)
             self.video_buffer.add(frame, landmarks=isl_lms)
 
-            # Auto-predict if video buffer reaches required temporal length
-            if self.video_buffer.frame_count() >= target_seq_len:
+            # Auto-predict if video buffer is full (32 frames reached)
+            if self.video_buffer.frame_count() >= self.video_buffer.sequence_length:
                 sequence, landmarks = self.video_buffer.get_data()
                 if self.language == "ISL":
                     result = self._word_recognizer().predict(sequence, pose_landmarks=landmarks)
@@ -377,61 +344,45 @@ class SignLanguageApp:
                 self.word_prediction = result.label
                 self.word_confidence = result.confidence
                 self.word_inference_ms = float(result.metadata.get("inference_ms", 0.0))
-                self.word_top_k = result.metadata.get("top_k", [])
-                self.word_diagnostics = result.metadata.get("diagnostics", {})
                 accepted = self.word_stabilizer.update(result.label, result.confidence)
                 if accepted and accepted not in ("NONE", "UNCERTAIN", "UNKNOWN", "MODEL_UNAVAILABLE"):
                     self.word_buffer.add_word(accepted)
-                    self.common_layer.add_entry(
-                        accepted,
-                        source=self.language,
-                        mode="WORD",
-                        confidence=self.word_confidence,
-                        metadata=result.metadata,
-                    )
-                    self.set_status(f"Confirmed {self.language} word: [{accepted}] ({self.word_confidence:.0%})")
-                    if self.tts.enabled:
+                    self.sentence_framer.add_word(accepted)
+                    self.composer.add_token(accepted)
+                    self.common_layer.add_entry(accepted, source=self.language, mode="WORD", confidence=self.word_confidence)
+                    self.set_status(f"Confirmed word: [{accepted}]")
+                    now = time.time()
+                    if self.tts.enabled and (now - self._last_tts_time) > 1.2:
+                        self._last_tts_time = now
                         self.tts.speak_token(accepted, is_completed_word=True, is_sentence=False)
                 self.video_buffer.clear()
+        return None
 
     def trigger_ai_retransform(
         self,
         speak_after: bool = True,
     ) -> None:
-        """Query the active AI language corrector to refine raw fingerspelling into a fluent sentence."""
+        """Query the active AI language corrector to refine words into a fluent grammatical sentence."""
         raw_stream = (
-            self.word_buffer.get_sentence()
-            if self._active_pipeline() == "WORD"
-            else self.composer.get_raw_stream()
+            " ".join(self.sentence_framer.get_active_words())
+            or self.word_buffer.get_sentence()
+            or self.composer.get_raw_stream()
         )
 
         if not raw_stream or not raw_stream.strip():
             return
 
-        if len(raw_stream.strip()) < 2:
-            return
-
-        self.ai_status = "AI TRANSFORMING..."
+        self.ai_status = "AI FRAMING..."
         self.set_status("AI reconstructing sentence...")
 
-        def _on_retransformed(
-            result: str,
-            source: str,
-        ):
-            if result:
-                self.ai_sentence = result
-                self.composer.set_retransformed_sentence(result)
-                self.ai_status = f"{source} READY"
-                self.set_status(f"AI Reconstructed: '{result}'")
-                if speak_after and self.tts.enabled:
-                    self.tts.speak_async(result)
-            else:
-                self.ai_status = "READY"
-
-        self.huggingface.retransform_async(
-            raw_stream,
-            callback=_on_retransformed,
-        )
+        framed = self.sentence_framer.frame_sentence(flush=False)
+        if framed:
+            self.ai_sentence = framed
+            self.composer.set_retransformed_sentence(framed)
+            self.ai_status = "AI READY"
+            self.set_status(f"Framed Sentence: '{framed}'")
+            if speak_after and self.tts.enabled:
+                self.tts.speak_token(framed, is_sentence=True)
 
     def cycle_translation(self) -> None:
         langs = ["es", "fr", "de", "hi", None]
@@ -479,47 +430,74 @@ class SignLanguageApp:
                     else:
                         primary_hand, all_hands, handedness = self.extractor.extract(frame)
 
-                    if self._active_pipeline() == "WORD":
+                    word_committed = None
+                    if self.mode in ("AUTO", "WORD"):
                         if self.extractor is not None and all_hands:
                             self.extractor.draw_landmarks(disp_cam, all_hands, handedness)
-                        self._process_word_frame(frame, primary_hand, all_hands, handedness)
-                        best_label = self.word_prediction
-                        conf = self.word_confidence
-                    elif primary_hand is not None:
-                        # Draw aesthetic hand skeleton
-                        self.extractor.draw_landmarks(disp_cam, all_hands, handedness)
+                        word_committed = self._process_word_frame(frame, primary_hand, all_hands, handedness)
+                        if self.word_prediction != "NONE" and self.word_confidence >= 0.85:
+                            best_label = self.word_prediction
+                            conf = self.word_confidence
 
-                        # 2. Preprocessing & Normalization
-                        feature_vec = normalize_landmarks(primary_hand)
+                    # Run Alphabet Fingerspelling if in FINGERSPELLING mode or in AUTO mode when no word gesture is committed
+                    if not word_committed and primary_hand is not None and self.mode in ("AUTO", "FINGERSPELLING"):
+                        if self.mode == "FINGERSPELLING" or (self.mode == "AUTO" and self.word_prediction == "NONE"):
+                            # Draw aesthetic hand skeleton
+                            if self.extractor is not None:
+                                self.extractor.draw_landmarks(disp_cam, all_hands, handedness)
 
-                        # 3. Machine Learning Classification
-                        best_label, conf, _ = self.classifier.predict(feature_vec)
-                        top_k = self.classifier.get_top_k(feature_vec, k=3)
+                            # 2. Preprocessing & Normalization
+                            feature_vec = normalize_landmarks(primary_hand)
 
-                        # 4. Temporal Prediction Stabilization
-                        committed = self.stabilizer.update(best_label, conf)
-                        if committed:
-                            # 5. Text Composition
-                            self.composer.add_token(committed)
-                            self.common_layer.add_entry(committed, source=self.language, mode="ALPHABET", confidence=conf)
-                            self.set_status(f"Confirmed Sign: [{committed}]")
+                            # 3. Machine Learning Classification
+                            best_label, conf, _ = self.classifier.predict(feature_vec)
+                            top_k = self.classifier.get_top_k(feature_vec, k=3)
 
-                            # 6. Audio TTS: uses mode (in sentence mode, individual letters are silent!)
-                            self.tts.speak_token(committed, is_completed_word=False, is_sentence=False)
-                    else:
+                            # 4. Temporal Prediction Stabilization
+                            committed = self.stabilizer.update(best_label, conf)
+                            if committed:
+                                # 5. Text Composition
+                                self.composer.add_token(committed)
+                                self.common_layer.add_entry(committed, source=self.language, mode="ALPHABET", confidence=conf)
+                                self.set_status(f"Confirmed Letter: [{committed}]")
+
+                                # Speak completed word when user signs SPACE
+                                if committed == "SPACE":
+                                    last_word = self.composer.get_last_completed_word() or self.composer.get_current_word()
+                                    if last_word:
+                                        self.sentence_framer.add_word(last_word)
+                                        self.word_buffer.add_word(last_word)
+                                        self.set_status(f"Completed Word: [{last_word}]")
+                                        now = time.time()
+                                        if self.tts.enabled and (now - self._last_tts_time) > 0.8:
+                                            self._last_tts_time = now
+                                            self.tts.speak_token(last_word, is_completed_word=True, is_sentence=False)
+                    elif primary_hand is None and not (all_hands and len(all_hands) >= 2):
                         # Hand not detected in this frame
                         self.stabilizer.mark_no_hand()
+                        self.word_stabilizer.mark_released()
                         boundary_word = self.composer.mark_no_hand()
                         if boundary_word:
-                            if self.ai_auto_trigger:
-                                raw_stream = self.composer.get_raw_stream()
-                                if raw_stream and len(raw_stream.strip()) >= 2:
-                                    self.trigger_ai_retransform(speak_after=True)
-                            elif self.enable_nlp:
-                                fluent = self.composer.get_current_sentence()
-                                if fluent:
-                                    self.set_status(f"Completed phrase: {fluent}")
-                                    self.tts.speak_async(fluent)
+                            self.sentence_framer.add_word(boundary_word)
+                            self.word_buffer.add_word(boundary_word)
+                            self.set_status(f"Completed Word: [{boundary_word}]")
+                            now = time.time()
+                            if self.tts.enabled and (now - self._last_tts_time) > 0.8:
+                                self._last_tts_time = now
+                                self.tts.speak_token(boundary_word, is_completed_word=True, is_sentence=False)
+
+                        # Auto-sentence framing after gesture pause (must have >= 2 words to frame sentence)
+                        now = time.time()
+                        if len(self.sentence_framer.words) >= 2 and (now - self.sentence_framer.last_word_time) > 2.2:
+                            if (now - self._last_sentence_tts_time) > 3.0:
+                                self._last_sentence_tts_time = now
+                                framed = self.sentence_framer.frame_sentence(flush=True)
+                                if framed and len(framed.strip()) >= 5:
+                                    self.ai_sentence = framed
+                                    self.composer.set_retransformed_sentence(framed)
+                                    self.set_status(f"Framed Sentence: '{framed}'")
+                                    if self.tts.enabled:
+                                        self.tts.speak_token(framed, is_sentence=True)
                 else:
                     cv2.putText(
                         disp_cam,
@@ -545,7 +523,7 @@ class SignLanguageApp:
                 elif key in (ord("g"), ord("G"), ord("h"), ord("H")):  # G/H to trigger AI re-transformation
                     self.trigger_ai_retransform(speak_after=True)
                 elif key in (ord("s"), ord("S")):  # S to speak sentence
-                    spoken_text = self.composer.get_display_sentence()
+                    spoken_text = self.sentence_framer.last_framed_sentence or self.composer.get_display_sentence()
                     if spoken_text:
                         self.tts.speak_async(spoken_text)
                         self.set_status(f"Speaking: '{spoken_text}'")
@@ -557,22 +535,12 @@ class SignLanguageApp:
                     self.set_status("Mode: ALPHABET (FINGERSPELLING)")
                 elif key == ord("2"):
                     self.mode = "WORD"
-                    self.language = "ISL"
-                    if self.isl_recognizer:
-                        self.isl_recognizer.set_mode("WORD")
-                    self.set_status("Mode: ISL WORD (PRETRAINED)")
+                    self.set_status("Mode: 100+ WORDS & GESTURES")
                 elif key == ord("3"):
-                    self.mode = "WORD"
-                    self.language = "ASL"
-                    self.set_status("Mode: ASL WORD (DYNAMIC)")
-                elif key == ord("4"):
                     self.mode = "AUTO"
-                    self.set_status(f"Mode: AUTO ({self._active_pipeline()})")
+                    self.set_status("Mode: AUTO (WORDS + LETTERS)")
                 elif key in (ord("l"), ord("L")):
                     self.language = "ISL" if self.language == "ASL" else "ASL"
-                    if self.language == "ISL" and self.mode == "WORD":
-                        if self.isl_recognizer:
-                            self.isl_recognizer.set_mode("WORD")
                     self.set_status(f"Language: {self.language}")
                 elif key == ord(" "):  # Space to pause/resume
                     self.is_paused = not self.is_paused
@@ -581,18 +549,17 @@ class SignLanguageApp:
                     self.composer.clear()
                     self.stabilizer.reset()
                     self.word_buffer.clear()
+                    self.sentence_framer.clear()
                     self.word_stabilizer.reset()
                     self.video_buffer.clear()
                     self.sign_segmenter.reset()
                     self.ai_sentence = ""
-                    self.set_status("Buffers cleared")
+                    self.set_status("Cleared all words, buffers and framed sentence")
                 elif key == 8:  # Backspace
-                    if self._active_pipeline() == "WORD":
-                        self.word_buffer.backspace()
-                        self.set_status("Deleted last word")
-                    else:
-                        self.composer.backspace()
-                        self.set_status("Deleted last sign")
+                    self.sentence_framer.backspace()
+                    self.word_buffer.backspace()
+                    self.composer.backspace()
+                    self.set_status("Deleted last word / sign")
                 elif key in (ord("t"), ord("T")):  # T to cycle translation
                     self.cycle_translation()
 
@@ -688,7 +655,9 @@ class SignLanguageApp:
         cv2.putText(canvas, disp_sign[:14], (sx + 20, cy + 48), cv2.FONT_HERSHEY_DUPLEX, 0.85, sign_col, 2, cv2.LINE_AA)
 
         # Retrieve action description for active sign
-        if self._active_pipeline() == "WORD":
+        if active_label in ExpandedSignDetector.SIGN_DESCRIPTIONS:
+            action_info = (active_label, ExpandedSignDetector.SIGN_DESCRIPTIONS[active_label])
+        elif self._active_pipeline() in ("WORD", "AUTO"):
             action_info = BASIC_WORD_ACTIONS.get(active_label, (active_label, f"Recognized sign in {self.language} vocabulary"))
         else:
             action_info = ALPHABET_ACTIONS.get(active_label, ("Resting hand", "Show an ASL alphabet sign to the camera"))
@@ -709,12 +678,12 @@ class SignLanguageApp:
         cv2.putText(canvas, f"CONTROLS [{self.language} | {self._active_pipeline()}]", (sx + 14, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 240, 255), 1)
         shortcuts = [
             ("[1]", "Alphabet Mode (Fingerspelling A-Z)"),
-            ("[2]", "ISL Word Mode (Pretrained Dynamic ISL)"),
-            ("[3]", "ASL Word Mode (Dynamic ASL)"),
+            ("[2]", f"Word Mode (100+ Signs & {self.language})"),
+            ("[3]", "AUTO Mode (Combined Letters & Words)"),
             ("[L]", f"Toggle Language (Active: {self.language})"),
-            ("[G]", "AI Reconstruct Sentence (Flan-T5 / HF)"),
-            ("[S]", "Speak Sentence via TTS"),
-            ("[C]", "Clear All Text / Buffers"),
+            ("[G]", "Frame Sentence (Gloss-to-English AI)"),
+            ("[S]", "Speak Active Sentence via TTS"),
+            ("[C]", "Clear Words & Sentence Buffers"),
             ("[Q]", "Quit Application"),
         ]
         sc_y = cy + 18
@@ -722,39 +691,27 @@ class SignLanguageApp:
             cv2.putText(canvas, f"{key:<6} : {desc}", (sx + 16, sc_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (190, 190, 200), 1)
             sc_y += 16
 
-        # Section 2: Reference Guide (Alphabet Grid vs Basic Signs)
+        # Section 2: Reference Guide (Alphabet Grid vs 100+ Words Guide)
         cy = 280
-        if self._active_pipeline() == "WORD":
-            if self.language == "ISL":
-                vocab = self.isl_word_recognizer.get_vocab() if self.isl_word_recognizer else []
-                cv2.putText(canvas, f"ISL VOCABULARY ({len(vocab)} SIGNS)", (sx + 14, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 240, 255), 1)
-                by_pos = cy + 18
-                display_signs = vocab[:8] if vocab else ["Hospital", "How_Are_You_", "Monday", "Night", "Shoe", "Street", "Thank You", "Yellow"]
-                for sname in display_signs:
-                    is_active = (active_label.strip().upper() == sname.strip().upper())
-                    tcol = (0, 255, 180) if is_active else (200, 200, 210)
-                    prefix = ">" if is_active else "*"
-                    cv2.putText(canvas, f"{prefix} {sname}", (sx + 16, by_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.34, tcol, 1)
-                    by_pos += 15
-            else:
-                cv2.putText(canvas, "ASL BASIC SIGNS (HEURISTIC & NEURAL)", (sx + 14, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 240, 255), 1)
-                basic_list = [
-                    ("HELLO", "Open palm facing camera"),
-                    ("YES", "Thumbs up with fist"),
-                    ("NO", "Thumbs down with fist"),
-                    ("I LOVE YOU", "Thumb + index + pinky up"),
-                    ("PEACE", "Index & middle up (V sign)"),
-                    ("OK", "Thumb & index ring, 3 up"),
-                    ("THANK YOU", "Namaste / palm forward"),
-                    ("HELP", "Thumbs up fist on palm"),
-                ]
-                by_pos = cy + 18
-                for sname, sdesc in basic_list:
-                    is_active = (active_label == sname)
-                    tcol = (0, 255, 180) if is_active else (200, 200, 210)
-                    prefix = ">" if is_active else "*"
-                    cv2.putText(canvas, f"{prefix} {sname:<12} : {sdesc[:24]}", (sx + 16, by_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.34, tcol, 1)
-                    by_pos += 15
+        if self._active_pipeline() in ("WORD", "AUTO"):
+            cv2.putText(canvas, "100+ VOCABULARY GUIDE (KEY SIGNS)", (sx + 14, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 240, 255), 1)
+            sample_signs = [
+                ("HELLO", "Open flat palm forward"),
+                ("YES / NO", "Thumbs up / Thumbs down"),
+                ("HELP / DOCTOR", "Thumbs up on palm / wrist tap"),
+                ("WATER / FOOD", "W-hand at lips / hand to mouth"),
+                ("PLEASE / THANK YOU", "Chest circular rub / chin to out"),
+                ("WHAT / WHERE", "Open palms shrug / Index waggle"),
+                ("I LOVE YOU / PEACE", "ILY sign / V-peace fingers"),
+                ("HOSPITAL / CALL ME", "Cross tap / Phone shaka"),
+            ]
+            by_pos = cy + 18
+            for sname, sdesc in sample_signs:
+                is_active = any(part.strip() == active_label for part in sname.split("/"))
+                tcol = (0, 255, 180) if is_active else (200, 200, 210)
+                prefix = ">" if is_active else "*"
+                cv2.putText(canvas, f"{prefix} {sname:<18} : {sdesc[:22]}", (sx + 16, by_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.33, tcol, 1)
+                by_pos += 15
         else:
             cv2.putText(canvas, "ASL ALPHABET GRID (A-Z, SPACE, DEL)", (sx + 14, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 240, 255), 1)
 
@@ -786,12 +743,15 @@ class SignLanguageApp:
         cv2.rectangle(canvas, (sx + 12, cy + 8), (sx + sw - 12, cy + 56), (24, 26, 32), -1)
         cv2.rectangle(canvas, (sx + 12, cy + 8), (sx + sw - 12, cy + 56), (50, 50, 65), 1)
 
-        ref_sign = active_label if active_label in ALPHABET_ACTIONS else "A"
-        ref_action = ALPHABET_ACTIONS.get(ref_sign, ("--", "--"))
+        ref_sign = active_label if (active_label in ALPHABET_ACTIONS or active_label in ExpandedSignDetector.SIGN_DESCRIPTIONS) else "A"
+        if ref_sign in ExpandedSignDetector.SIGN_DESCRIPTIONS:
+            ref_action = (ref_sign, ExpandedSignDetector.SIGN_DESCRIPTIONS[ref_sign])
+        else:
+            ref_action = ALPHABET_ACTIONS.get(ref_sign, ("--", "--"))
         cv2.putText(canvas, f"Sign [{ref_sign}]: {ref_action[0]}", (sx + 20, cy + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 200), 1)
         cv2.putText(canvas, f"{ref_action[1][:48]}", (sx + 20, cy + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (180, 180, 190), 1)
 
-        # Section 4: Gemini AI Status & TTS Indicator Card
+        # Section 4: AI Status & TTS Indicator Card
         cy = 430
         tts_active = getattr(self.tts, "is_speaking", False)
         tts_bg = (0, 80, 40) if tts_active else (28, 28, 36)
@@ -804,38 +764,28 @@ class SignLanguageApp:
         cv2.putText(canvas, f"AI: [{self.ai_status}]", (sx + 20, cy + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.40, ai_color, 1)
 
         # TTS pill
-        tts_text = f"TTS: [SPEAKING...]" if tts_active else f"TTS: [{self.tts.mode.upper()} MODE]"
+        tts_text = "TTS: [SPEAKING...]" if tts_active else f"TTS: [{self.tts.mode.upper()} - SPEECH READY]"
         cv2.putText(canvas, tts_text, (sx + 20, cy + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 240, 160) if tts_active else (160, 160, 170), 1)
 
         cy = 472
         cv2.putText(canvas, "RECOGNITION DEBUG PANEL", (sx + 14, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 240, 255), 1)
-        isl_status_str = (
-            f"READY ({len(self.isl_word_recognizer.get_vocab())} signs)"
-            if self.isl_word_recognizer and self.isl_word_recognizer.is_loaded()
-            else "UNAVAILABLE"
-        )
-        asl_status_str = "READY" if self.asl_recognizer.is_loaded() else "UNAVAILABLE"
-        target_seq = 30 if self.language == "ISL" else self.video_buffer.sequence_length
         debug_lines = [
-            f"Mode: {self._active_pipeline()} [{self.language}]",
-            f"Prediction: {active_label} ({confidence * 100:.0f}%)",
-            f"Latest Word: {self.word_buffer.get_last_word() or 'NONE'}",
-            f"Buffer Frames: {self.video_buffer.frame_count()} / {target_seq}",
-            f"Latency: {self.word_inference_ms:.1f} ms",
-            f"ISL Model: {isl_status_str}",
-            f"ASL Model: {asl_status_str}",
+            f"Current Prediction: {active_label}",
+            f"Confidence: {confidence * 100:.0f}% (Threshold: {self.stabilizer.min_conf * 100:.0f}%)",
+            f"Stable Frames: {self.stabilizer.stable_count} / {self.stabilizer.required_stable_frames}",
+            f"Hand Detected: {'YES' if self.stabilizer.hand_detected else 'NO'}",
+            f"State: {self.stabilizer.state}",
+            f"Last Committed: {self.stabilizer.last_committed or 'NONE'}",
+            f"Recognition Mode: {self._active_pipeline()} [{self.language}]",
+            f"Buffer Frames: {self.video_buffer.frame_count()} (Segment: {self.sign_segmenter.state})",
+            f"Vocabulary: 100+ Real Signs & ASL Finger-spelling",
         ]
-        if self._active_pipeline() == "WORD" and self.word_top_k:
-            top_str = ", ".join(f"{x.get('class', '')[:7]}:{x.get('confidence', 0):.0%}" for x in self.word_top_k[:3])
-            debug_lines.append(f"Top 3: {top_str}")
-        else:
-            debug_lines.append(f"Stable Frames: {self.stabilizer.stable_count} / {self.stabilizer.required_stable_frames}")
         for line in debug_lines:
             cy += 12
             cv2.putText(canvas, line, (sx + 16, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (185, 185, 195), 1)
 
     def _render_bottom_ribbon(self, canvas: np.ndarray) -> None:
-        """Render the bottom ribbon displaying Raw Sign Stream, Gemini Predicted Sentence, and Translation."""
+        """Render the bottom ribbon displaying Recognized Words, Framed Sentence, and Vocalization/TTS status."""
         rx = 0
         ry = self.cam_h
         rw = self.total_w
@@ -844,34 +794,38 @@ class SignLanguageApp:
         cv2.line(canvas, (0, ry), (rw, ry), (50, 50, 60), 2)
         cv2.rectangle(canvas, (0, ry), (rw, self.total_h), (14, 14, 18), -1)
 
-        # Line 1: Raw Recognition Stream
-        raw_stream = (
-            self.word_buffer.get_sentence()
-            if self._active_pipeline() == "WORD"
-            else self.composer.get_raw_stream()
-        )
+        # Line 1: Recognized Word Stream / Buffer
+        active_words = self.sentence_framer.get_active_words() if hasattr(self, "sentence_framer") else []
+        if active_words:
+            raw_stream = " -> ".join(active_words)
+        else:
+            raw_stream = self.word_buffer.get_sentence() if self._active_pipeline() in ("WORD", "AUTO") else self.composer.get_raw_stream()
+
         if not raw_stream:
-            raw_stream = "[Spell ASL letters to compose phrase]"
-        cv2.putText(canvas, "RAW SIGN STREAM:", (16, ry + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 150, 160), 1)
+            raw_stream = "[Perform any of 100+ signs or ASL alphabet to begin]"
+
+        cv2.putText(canvas, "RECOGNIZED WORDS:", (16, ry + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 150, 160), 1)
         disp_raw = raw_stream if len(raw_stream) < 55 else "..." + raw_stream[-52:]
         cv2.putText(canvas, disp_raw, (175, ry + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 220, 255), 1, cv2.LINE_AA)
 
-        # Line 2: Gemini AI Predicted Fluent Sentence
-        display_sentence = self.composer.get_display_sentence()
-        if not display_sentence:
-            display_sentence = "[AI reconstructed sentence will appear here]"
-        cv2.putText(canvas, "AI FLUENT SENTENCE:", (16, ry + 52), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 240, 200), 1)
-        cv2.putText(canvas, display_sentence, (195, ry + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+        # Line 2: Framed Natural Sentence (from SentenceFramingEngine)
+        framed_sent = self.sentence_framer.last_framed_sentence if (hasattr(self, "sentence_framer") and self.sentence_framer.last_framed_sentence) else self.composer.get_display_sentence()
+        if not framed_sent:
+            framed_sent = "[AI framed sentence & speech will synthesize here automatically]"
+        cv2.putText(canvas, "FRAMED SENTENCE:", (16, ry + 52), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 240, 200), 1)
+        disp_framed = framed_sent if len(framed_sent) < 50 else framed_sent[:47] + "..."
+        cv2.putText(canvas, disp_framed, (195, ry + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2, cv2.LINE_AA)
 
-        # Line 3: Translation or Live System Status
-        if self.enable_trans:
-            trans_text = translate_sentence(display_sentence, self.target_lang)
+        # Line 3: Translation or Live System Status + TTS indicator
+        tts_notice = "[SPEECH: PLAYING]" if getattr(self.tts, "is_speaking", False) else "[SPEECH: READY]"
+        if self.enable_trans and framed_sent and not framed_sent.startswith("["):
+            trans_text = translate_sentence(framed_sent, self.target_lang)
             cv2.putText(
                 canvas,
-                f"[{self.target_lang.upper()} TRANSLATION]: {trans_text}",
+                f"[{self.target_lang.upper()} TRANSLATION]: {trans_text}   {tts_notice}",
                 (16, ry + 84),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.50,
+                0.48,
                 (0, 230, 255),
                 1,
                 cv2.LINE_AA,
@@ -879,11 +833,11 @@ class SignLanguageApp:
         else:
             cv2.putText(
                 canvas,
-                f"STATUS: {self._status_message}",
+                f"STATUS: {self._status_message} | Words: {len(active_words)} buffered | {tts_notice}",
                 (16, ry + 84),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.46,
-                (0, 255, 180),
+                0.44,
+                (180, 185, 200),
                 1,
                 cv2.LINE_AA,
             )
@@ -904,13 +858,7 @@ def main():
     parser.add_argument("--camera", type=int, default=None, help="Override camera index")
     parser.add_argument("--mock", action="store_true", help="Run with mock camera stream for headless testing")
     parser.add_argument("--no-tts", action="store_true", help="Disable voice audio synthesis")
-    parser.add_argument(
-        "--mode",
-        choices=["WORD", "FINGERSPELLING", "ALPHABET", "ISL_WORD", "ASL_WORD", "AUTO"],
-        default=None,
-        help="Recognition pipeline mode",
-    )
-    parser.add_argument("--language", choices=["ISL", "ASL"], default=None, help="Recognition language (ISL or ASL)")
+    parser.add_argument("--mode", choices=["WORD", "FINGERSPELLING", "AUTO"], default=None, help="Recognition pipeline mode")
     parser.add_argument("--frames", type=int, default=None, help="Run for N frames then exit (for automated testing)")
     args = parser.parse_args()
 
@@ -920,7 +868,6 @@ def main():
         mock_mode=args.mock,
         disable_tts=args.no_tts,
         mode_override=args.mode,
-        language_override=args.language,
     )
     app.run(max_frames=args.frames)
 

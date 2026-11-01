@@ -100,6 +100,21 @@ Pretrained models were researched, benchmarked, and selected based on licensing,
 - **Temporal Stabilizer**: Uses windowed majority voting (`window = 8`, `min_ratio = 0.65`) and debouncing to ensure hands are held in pose before accepting characters.
 - **Word Stabilizer**: Consecutive agreement window for dynamic video signs.
 
+### 3.6 Everyday Sign Language Recognition Pipeline
+- **Dataset & Curated Lexicon**: 51 core classes across Greetings, Affirmations, Emergency/Medical, Daily Needs, Questions, People, Actions, Feelings, Time, and Objects (`src/recognition/everyday_sign_dataset.py`).
+- **Feature Extraction**: Landmark normalization centered at wrist with middle-MCP scale normalization (`src/recognition/landmark_feature_pipeline.py`).
+- **Temporal Neural Architecture**: 2-layer Bidirectional LSTM with temporal attention pooling and linear classification head (`src/recognition/everyday_sign_model.py`). Runs at **~11.6 ms CPU latency (>85 FPS)**.
+- **Fast Geometric Detector**: Real-time Euclidean spatial geometry detecting 100+ conversational signs (`src/recognition/expanded_sign_detector.py`) at `< 1 ms` latency.
+- **Unified Router**: `SignModelRouter` (`src/recognition/sign_model_router.py`) seamlessly switches between `AUTO`, `WORD`, `EVERYDAY`, and `ALPHABET` without state conflicts.
+
+### 3.7 Sentence Framing & Natural Language Engine
+- **SentenceFramingEngine** (`src/language/sentence_framing_engine.py`): Reconstructs raw glosses into fluent, grammatically correct English sentences using:
+  1. High-frequency conversational phrase patterns (instant local execution).
+  2. Local Hugging Face seq2seq corrector (`google/flan-t5-small`).
+  3. Cloud LLM corrector fallback (Gemini / Qwen API).
+- **Auto-Framing on Pause**: Automatically frames and speaks the assembled sentence via TTS when the user finishes signing and pauses.
+- **Word Builder & Dictionary**: Fuzzy matching and auto-suggestions for fingerspelling (`src/language/word_builder.py`).
+
 ---
 
 ## 4. User Interfaces
@@ -220,54 +235,62 @@ python training/finetune_asl.py --data path/to/landmarks.npz --output models/asl
 ```
 mini_project/
 ├── config/
-│   └── config.yaml               # Central configuration (thresholds, models, TTS)
+│   └── config.yaml                     # Central configuration (thresholds, models, TTS)
 ├── evaluation/
-│   ├── evaluate_asl.py           # ASL benchmarks & evaluation
-│   ├── evaluate_isl.py           # ISL benchmarks & evaluation
-│   └── evaluate_speech.py        # Speech WER / latency benchmarks
+│   ├── evaluate_asl.py                 # ASL benchmarks & evaluation
+│   ├── evaluate_everyday_sign.py       # Everyday BiLSTM sign benchmark
+│   ├── evaluate_isl.py                 # ISL benchmarks & evaluation
+│   └── evaluate_speech.py              # Speech WER / latency benchmarks
 ├── frontend/
-│   ├── index.html                # Modern HTML5 Web UI
-│   ├── style.css                 # Glassmorphic dark design system
-│   └── app.js                    # WebRTC & client-side inference loop
+│   ├── index.html                      # Modern HTML5 Web UI
+│   ├── style.css                       # Glassmorphic dark design system
+│   └── app.js                          # WebRTC & client-side inference loop
 ├── models/
-│   ├── gesture_classifier.onnx   # Static alphabet ONNX classifier
-│   ├── hand_landmarker.task      # MediaPipe Hand landmark model
-│   ├── asl/                      # WLASL I3D model checkpoint & labels
-│   └── isl/                      # ISL fine-tuned weights & labels
+│   ├── gesture_classifier.onnx         # Static alphabet ONNX classifier
+│   ├── hand_landmarker.task            # MediaPipe Hand landmark model
+│   ├── asl/                            # WLASL I3D model checkpoint & labels
+│   ├── everyday_signs/                 # BiLSTM temporal models (ASL & ISL)
+│   └── isl/                            # ISL fine-tuned weights & labels
 ├── src/
 │   ├── api/
 │   │   ├── __init__.py
-│   │   └── server.py             # FastAPI / HTTP REST & WebSocket API
+│   │   └── server.py                   # FastAPI / HTTP REST & WebSocket API
 │   ├── communication/
 │   │   ├── __init__.py
-│   │   └── common_text_layer.py  # Unified multi-modal communication layer
+│   │   └── common_text_layer.py        # Unified multi-modal communication layer
+│   ├── language/
+│   │   ├── sentence_framing_engine.py  # Gloss-to-English grammar reconstruction
+│   │   └── word_builder.py             # Spelled word builder & suggestions
 │   ├── recognition/
-│   │   ├── asl_model_adapter.py  # WLASL I3D model adapter
-│   │   ├── asl_recognizer.py     # ASL recognition pipeline
-│   │   ├── base_recognizer.py    # Common recognition interface
-│   │   ├── isl_alphabet_adapter.py # Hugging Face ISL image classifier adapter
-│   │   ├── isl_model_adapter.py  # ISL video adapter
-│   │   ├── isl_recognizer.py     # ISL dual-mode recognition pipeline
-│   │   └── recognition_result.py # Standardized prediction dataclass
+│   │   ├── asl_recognizer.py           # ASL recognition pipeline
+│   │   ├── everyday_sign_dataset.py    # 51-class dataset & vocabulary
+│   │   ├── everyday_sign_model.py      # BiLSTM + Attention temporal model
+│   │   ├── expanded_sign_detector.py   # 100+ word invariant geometric recognizer
+│   │   ├── isl_recognizer.py           # ISL dual-mode recognition pipeline
+│   │   ├── landmark_feature_pipeline.py # Landmark normalization pipeline
+│   │   ├── sign_model_router.py        # Unified multi-model routing dispatcher
+│   │   └── word_stabilizer.py          # Dynamic sign debouncer & smoother
 │   ├── speech/
-│   │   ├── __init__.py
-│   │   ├── audio_capture.py      # sounddevice microphone capture
-│   │   └── speech_recognizer.py  # OpenAI Whisper ASR recognizer
-│   ├── app.py                    # OpenCV desktop HUD dashboard
-│   ├── classifier.py             # Landmark classifier wrapper
-│   ├── landmark_extractor.py     # MediaPipe hand tracker
-│   ├── stabilizer.py             # Temporal smoothing & debouncer
-│   ├── text_composer.py          # Word & sentence buffer
-│   └── tts.py                    # Text-to-speech audio engine
+│   │   ├── audio_capture.py            # sounddevice microphone capture
+│   │   └── speech_recognizer.py        # OpenAI Whisper ASR recognizer
+│   ├── app.py                          # OpenCV desktop HUD dashboard
+│   ├── classifier.py                   # Landmark classifier wrapper
+│   ├── landmark_extractor.py           # MediaPipe hand tracker
+│   ├── stabilizer.py                   # Temporal smoothing & debouncer
+│   ├── text_composer.py                # Spelled word & sentence buffer
+│   └── tts.py                          # Text-to-speech audio engine
 ├── tests/
-│   ├── test_multimodal_system.py # End-to-end multimodal test suite
-│   └── ...                       # Component unit tests
+│   ├── test_everyday_sign_pipeline.py  # Everyday BiLSTM test suite
+│   ├── test_expanded_words_and_sentences.py # 100+ word & sentence framing tests
+│   ├── test_multimodal_system.py       # End-to-end multimodal test suite
+│   └── ...                             # Component unit tests (76 passing)
 ├── training/
-│   ├── finetune_asl.py           # ASL training script
-│   └── finetune_isl.py           # ISL fine-tuning script
-├── main.py                       # CLI & application entrypoint
-├── requirements.txt              # Complete dependency specifications
-└── README.md                     # Comprehensive documentation
+│   ├── finetune_asl.py                 # ASL training script
+│   ├── finetune_isl.py                 # ISL fine-tuning script
+│   └── train_everyday_sign.py          # BiLSTM everyday sign training script
+├── main.py                             # CLI & application entrypoint
+├── requirements.txt                    # Complete dependency specifications
+└── README.md                           # Comprehensive documentation
 ```
 
 ---

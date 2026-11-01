@@ -37,6 +37,9 @@
 
       <!-- Global Controls / Status Bar -->
       <div class="header-controls">
+        <button id="btn-vocabulary-toggle" class="btn btn-sm btn-outline" title="Browse 100+ Conversational Sign Language Dictionary">
+          📖 100+ Words Guide
+        </button>
         <div class="status-badge" id="system-status-badge">
           <span class="status-dot"></span>
           <span id="system-status-text">Connecting...</span>
@@ -73,8 +76,9 @@
             <div class="custom-select-wrapper">
               <label for="select-mode">Mode:</label>
               <select id="select-mode" class="styled-select">
-                <option value="ALPHABET" selected>Alphabet (Static)</option>
-                <option value="WORD">Sign / Word (Dynamic)</option>
+                <option value="AUTO" selected>AUTO (Words + Alphabet)</option>
+                <option value="WORD">100+ Signs / Words</option>
+                <option value="ALPHABET">Alphabet (Fingerspelling)</option>
               </select>
             </div>
           </div>
@@ -148,6 +152,46 @@
           <div class="detection-status-banner" id="detection-status-banner">
             <span class="status-icon" id="status-icon">💡</span>
             <span id="detection-status-text">Position hands clearly within camera frame</span>
+          </div>
+        </div>
+
+        <!-- AI Framed Sentence & Active Signs Card -->
+        <div class="framed-sentence-card" id="framed-sentence-card">
+          <div class="framed-header">
+            <div class="framed-title-group">
+              <span class="sparkle-icon">✨</span>
+              <div>
+                <h3>AI Framed Sentence</h3>
+                <p class="card-subtitle">Gloss-to-English Reconstruction with Automatic Speech</p>
+              </div>
+            </div>
+            <div class="framed-btn-actions">
+              <button id="btn-frame-sentence" class="btn btn-sm btn-accent" title="Reconstruct fluent sentence now">
+                ✨ Frame Now
+              </button>
+              <button id="btn-speak-sentence" class="btn btn-sm btn-outline" title="Speak sentence aloud via TTS">
+                🔊 Speak
+              </button>
+              <button id="btn-clear-words" class="btn btn-sm btn-outline" title="Clear buffered signs">
+                🧹 Clear
+              </button>
+            </div>
+          </div>
+
+          <!-- Active Word Tokens Trail -->
+          <div class="active-words-container">
+            <span class="active-words-label">BUFFERED SIGNS:</span>
+            <div class="active-words-list" id="active-words-list">
+              <span class="word-chip-placeholder">No signs buffered yet. Perform signs to compose.</span>
+            </div>
+          </div>
+
+          <!-- Reconstructed Fluent Sentence -->
+          <div class="sentence-result-box">
+            <span class="caption">RECONSTRUCTED FLUENT SENTENCE</span>
+            <div class="sentence-text" id="framed-sentence-text">
+              [AI framed sentence and speech will synthesize automatically]
+            </div>
           </div>
         </div>
       </section>
@@ -283,6 +327,28 @@
         </div>
         <div class="modal-footer">
           <button id="btn-save-settings" class="btn btn-primary">Save & Apply</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 100+ Vocabulary Dictionary Modal -->
+    <div class="modal-backdrop" id="vocabulary-modal" style="display: none;">
+      <div class="modal-card modal-wide">
+        <div class="modal-header">
+          <div class="vocab-modal-title">
+            <h3>100+ Conversational Sign Language Dictionary</h3>
+            <span class="badge-count" id="vocab-total-count">102 Signs</span>
+          </div>
+          <button id="btn-close-vocab" class="icon-btn">&times;</button>
+        </div>
+        <div class="vocab-modal-search">
+          <input type="text" id="input-vocab-search" placeholder="Search signs (e.g. 'HELP', 'HOSPITAL', 'WATER', 'HELLO')..." />
+        </div>
+        <div class="vocab-categories-bar" id="vocab-categories-bar">
+          <!-- Category buttons dynamically populated -->
+        </div>
+        <div class="vocab-grid-container" id="vocab-grid-container">
+          <!-- Sign items dynamically populated -->
         </div>
       </div>
     </div>

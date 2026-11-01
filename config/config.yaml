@@ -12,13 +12,13 @@ model_paths:
   yolo_roi: null
   asl_model: models/asl/pytorch_model.bin
   asl_labels: models/asl/labels.json
-  isl_model: models/isl/best_model.pth
-  isl_labels: models/isl/labels.json
+  isl_model: models/isl/best_model_new.pth
+  isl_labels: models/isl/metadata.json
 
 # Recognition Pipeline Configuration
 recognition:
   language: ASL # "ASL" (default with full local models) or "ISL"
-  mode: ALPHABET # "ALPHABET" or "WORD" or "AUTO"
+  mode: AUTO # "AUTO" (recognizes 100+ words and fingerspelling), "WORD", or "ALPHABET"
   target_fps: 15
   max_frames: 64
   min_frames: 8
@@ -27,13 +27,13 @@ recognition:
   max_sign_frames: 64
   movement_threshold: 0.015
   pause_frames: 8
-  word_stabilizer_window: 1
-  word_min_confidence: 0.20
+  word_stabilizer_window: 5
+  word_min_confidence: 0.75
 
 # Confidence Thresholds (Configurable per language)
 thresholds:
-  isl: 0.25 # Configurable cutoff for ISL alphabet/word recognition
-  asl: 0.20 # Configurable cutoff for ASL recognition
+  isl: 0.65 # Confirmed cutoff for ISL recognition
+  asl: 0.65 # Confirmed cutoff for ASL recognition
   uncertain_message: "Sign not recognized. Please try again."
 
 # ISL Model Configuration (Hugging Face)
@@ -100,9 +100,10 @@ labels:
 
 stabilizer:
   window: 8
-  min_ratio: 0.65
-  min_conf: 0.60
-  debounce_frames: 6
+  min_ratio: 0.70
+  min_conf: 0.70
+  required_stable_frames: 6
+  debounce_frames: 10
 
 text_composer:
   no_hand_timeout_frames: 45
@@ -110,7 +111,7 @@ text_composer:
 
 tts:
   enabled: true
-  mode: "sentence" # "sentence", "word", or "letter"
+  mode: "both" # "both" (speaks words and sentences), "word", "sentence", or "letter"
   rate: 165
   volume: 1.0
   voice_id: null

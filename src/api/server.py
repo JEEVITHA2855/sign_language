@@ -43,6 +43,10 @@ from src.classifier import GestureClassifier
 from src.preprocessing import normalize_landmarks
 from src.recognition.video_buffer import VideoBuffer
 from src.recognition.basic_sign_detector import BasicSignDetector
+from src.recognition.expanded_sign_detector import ExpandedSignDetector
+from src.recognition.sign_model_router import SignModelRouter
+from src.language.sentence_framing_engine import SentenceFramingEngine
+from src.text_composer import TextComposer
 
 
 class SignLanguageAPIService:
@@ -103,18 +107,53 @@ class SignLanguageAPIService:
             min_conf=0.70,
         )
         self.word_stabilizer = WordStabilizer(
-            window=1,
-            min_confidence=0.20,
+            window=3,
+            min_confidence=0.65,
+            cooldown_seconds=0.8,
         )
+        self.text_composer = TextComposer(no_hand_timeout_frames=5, auto_space=True)
         self.basic_sign_detector = BasicSignDetector()
+        self.expanded_detector = ExpandedSignDetector()
+        self.sign_router = SignModelRouter(language=self.language, mode=self.mode, models_dir="models")
+        self._last_tts_time = 0.0
 
         # TTS Engine
         try:
-            self.tts = TTSEngine(enabled=self.tts_enabled)
+            self.tts = TTSEngine(enabled=self.tts_enabled, mode="both")
         except Exception:
             self.tts = None
 
-        print("[APIService] Initialization complete.")
+        # Sentence Framing Engine (Gloss-to-English Reconstruction + Dual TTS)
+        self.sentence_framer = SentenceFramingEngine(
+            hf_corrector=None,
+            tts=self.tts,
+            auto_speak=self.tts_enabled,
+        )
+
+        print("[APIService] Initialization complete (100+ Vocabulary & Sentence Framing Ready).")
+
+    def get_vocabulary(self) -> Dict[str, Any]:
+        """Return the complete 100+ words dictionary and categories."""
+        return {
+            "total_words": len(self.expanded_detector.ALL_WORDS),
+            "categories": self.expanded_detector.VOCABULARY_CATEGORIES,
+            "descriptions": self.expanded_detector.SIGN_DESCRIPTIONS,
+        }
+
+    def frame_sentence(self, force: bool = True) -> Dict[str, Any]:
+        """Reconstruct a grammatically correct sentence from the buffered words and speak it."""
+        sentence = self.sentence_framer.frame_sentence(force=force, speak=self.tts_enabled)
+        return {
+            "sentence": sentence,
+            "words": self.sentence_framer.get_active_words(),
+            "spoken": self.tts_enabled,
+        }
+
+    def clear_sentence_buffer(self) -> Dict[str, Any]:
+        """Clear active words and sentence buffers."""
+        self.sentence_framer.clear()
+        self.text_composer.commit_sentence()
+        return {"success": True, "message": "Sentence buffer cleared"}
 
     def get_status(self) -> Dict[str, Any]:
         """Return the current status of all models and pipelines."""
@@ -122,6 +161,7 @@ class SignLanguageAPIService:
             "status": "online",
             "active_language": self.language,
             "active_mode": self.mode,
+            "vocabulary_size": len(self.expanded_detector.ALL_WORDS),
             "thresholds": {
                 "isl": self.isl_threshold,
                 "asl": self.asl_threshold,
@@ -165,9 +205,9 @@ class SignLanguageAPIService:
         """Update system settings dynamically."""
         if "language" in payload and payload["language"] in {"ISL", "ASL"}:
             self.language = payload["language"]
-        if "mode" in payload and payload["mode"] in {"ALPHABET", "WORD"}:
+        if "mode" in payload and payload["mode"] in {"ALPHABET", "WORD", "AUTO"}:
             self.mode = payload["mode"]
-            self.isl_recognizer.set_mode(self.mode)
+            self.isl_recognizer.set_mode(self.mode if self.mode != "AUTO" else "WORD")
         if "isl_threshold" in payload:
             self.isl_threshold = float(payload["isl_threshold"])
             self.isl_recognizer.confidence_threshold = self.isl_threshold
@@ -177,11 +217,35 @@ class SignLanguageAPIService:
             self.tts_enabled = bool(payload["tts_enabled"])
             if self.tts:
                 self.tts.enabled = self.tts_enabled
+            self.sentence_framer.auto_speak = self.tts_enabled
 
         return self.get_status()
 
     def process_frame(self, frame_b64: str) -> Dict[str, Any]:
         """Decode base64 image frame and perform sign recognition."""
+        # Check for auto-framing on pause/idle
+        auto_framed = self.sentence_framer.check_auto_frame()
+
+        if not frame_b64 or not frame_b64.strip():
+            threshold = self.isl_threshold if self.language == "ISL" else self.asl_threshold
+            return {
+                "language": self.language,
+                "mode": self.mode,
+                "raw_label": "NONE",
+                "display_label": "--",
+                "confidence": 0.0,
+                "threshold": threshold,
+                "is_uncertain": True,
+                "smoothed_label": None,
+                "inference_ms": 0.0,
+                "top_k": [],
+                "active_words": self.sentence_framer.get_active_words(),
+                "framed_sentence": self.sentence_framer.last_framed_sentence or "",
+                "auto_framed": bool(auto_framed),
+                "transcript_summary": self.common_layer.get_full_transcript(),
+            }
+
+        threshold = self.isl_threshold if self.language == "ISL" else self.asl_threshold
         try:
             # Strip data URL prefix if present
             if "," in frame_b64:
@@ -190,7 +254,19 @@ class SignLanguageAPIService:
             np_arr = np.frombuffer(img_bytes, np.uint8)
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             if frame is None:
-                return {"error": "Failed to decode frame image"}
+                return {
+                    "language": self.language,
+                    "mode": self.mode,
+                    "raw_label": "NONE",
+                    "display_label": "--",
+                    "confidence": 0.0,
+                    "threshold": threshold,
+                    "is_uncertain": True,
+                    "smoothed_label": None,
+                    "inference_ms": 0.0,
+                    "top_k": [],
+                    "transcript_summary": self.common_layer.get_full_transcript(),
+                }
         except Exception as exc:
             return {"error": f"Frame decode error: {exc}"}
 
@@ -217,6 +293,20 @@ class SignLanguageAPIService:
                     self.alphabet_stabilizer.mark_no_hand()
                     label = "NO_HAND"
                     confidence = 0.0
+                    boundary_word = self.text_composer.mark_no_hand()
+                    if boundary_word:
+                        self.common_layer.add_entry(
+                            text=boundary_word,
+                            source=self.language,
+                            mode=self.mode,
+                            confidence=0.92,
+                            metadata={"inference_ms": 0.0},
+                        )
+                        self.sentence_framer.add_word(boundary_word)
+                        now = time.time()
+                        if self.tts_enabled and self.tts and (now - self._last_tts_time) > 0.8:
+                            self._last_tts_time = now
+                            self.tts.speak_token(boundary_word, is_completed_word=True)
             else:
                 # ISL Alphabet
                 result = self.isl_recognizer.predict([frame])
@@ -233,13 +323,27 @@ class SignLanguageAPIService:
                 primary_hand, all_hands, handedness = self.extractor.extract(frame)
 
             if primary_hand is not None:
-                # 1. Instant Basic Sign Detection (Geometry Classifier)
-                basic_sign, basic_conf = self.basic_sign_detector.detect(primary_hand, all_hands)
-                if basic_sign and basic_conf >= 0.85:
-                    label = basic_sign
-                    confidence = basic_conf
-                    top_k = [{"label": basic_sign, "confidence": basic_conf}]
-                    smoothed_label = self.word_stabilizer.update(basic_sign, basic_conf)
+                self.sign_router.set_language(self.language)
+                self.sign_router.set_mode(self.mode)
+                route_res = self.sign_router.route_and_predict(primary_hand, all_hands)
+                if route_res.label not in ("NONE", "MODEL_UNAVAILABLE") and route_res.confidence >= 0.65:
+                    label = route_res.label
+                    confidence = route_res.confidence
+                    top_k = [{"label": route_res.label, "confidence": route_res.confidence}]
+                    smoothed_label = self.word_stabilizer.update(route_res.label, route_res.confidence)
+                elif self.mode == "AUTO" and self.language == "ASL" and self.asl_classifier is not None:
+                    # Combined AUTO mode: fall back to Alphabet fingerspelling
+                    vec = normalize_landmarks(primary_hand)
+                    alpha_label, alpha_conf, _ = self.asl_classifier.predict(vec)
+                    if alpha_conf >= 0.70:
+                        label = alpha_label
+                        confidence = alpha_conf
+                        raw_top = self.asl_classifier.get_top_k(vec, k=3)
+                        top_k = [{"label": l, "confidence": round(float(c), 3)} for l, c in raw_top]
+                        smoothed_label = self.alphabet_stabilizer.update(label, confidence)
+                    else:
+                        label = "UNCERTAIN"
+                        confidence = alpha_conf
                 else:
                     isl_lms = (
                         self.extractor.extract_isl_features(frame, all_hands_xyz=all_hands, handedness_labels=handedness)
@@ -278,6 +382,20 @@ class SignLanguageAPIService:
                 else:
                     label = "NO_HAND"
                     confidence = 0.0
+                    boundary_word = self.text_composer.mark_no_hand()
+                    if boundary_word:
+                        self.common_layer.add_entry(
+                            text=boundary_word,
+                            source=self.language,
+                            mode=self.mode,
+                            confidence=0.92,
+                            metadata={"inference_ms": 0.0},
+                        )
+                        self.sentence_framer.add_word(boundary_word)
+                        now = time.time()
+                        if self.tts_enabled and self.tts and (now - self._last_tts_time) > 0.8:
+                            self._last_tts_time = now
+                            self.tts.speak_token(boundary_word, is_completed_word=True)
                 self.video_buffer.clear()
 
         inference_ms = (time.perf_counter() - t0) * 1000.0
@@ -285,17 +403,46 @@ class SignLanguageAPIService:
         is_uncertain = confidence < threshold or label in {"UNCERTAIN", "MODEL_UNAVAILABLE", "UNKNOWN", "ERROR", "NO_HAND"} or "BUFFERING" in label
         display_text = label if not is_uncertain else ("Sign not recognized. Please try again." if label not in ("NO_HAND", "NONE") and "BUFFERING" not in label else "--")
 
-        # If a stable sign or word is confirmed, push to common text layer
+        # If a stable sign or word is confirmed, push to common text layer and sentence framer
         if smoothed_label:
-            self.common_layer.add_entry(
-                text=smoothed_label,
-                source=self.language,
-                mode=self.mode,
-                confidence=confidence,
-                metadata={"inference_ms": inference_ms},
-            )
-            if self.tts_enabled and self.tts:
-                self.tts.speak_async(smoothed_label)
+            if len(smoothed_label) == 1 and smoothed_label.isalpha():
+                self.text_composer.add_token(smoothed_label)
+                curr_spelled = self.text_composer.get_current_word()
+                if curr_spelled:
+                    display_text = f"Spelling: {curr_spelled}"
+            elif smoothed_label == "SPACE":
+                completed_word = self.text_composer.get_last_completed_word() or self.text_composer.get_current_word()
+                self.text_composer.add_token("SPACE")
+                if completed_word:
+                    self.common_layer.add_entry(
+                        text=completed_word,
+                        source=self.language,
+                        mode=self.mode,
+                        confidence=confidence,
+                        metadata={"inference_ms": inference_ms},
+                    )
+                    self.sentence_framer.add_word(completed_word)
+                    display_text = f"Word: [{completed_word}]"
+                    now = time.time()
+                    if self.tts_enabled and self.tts and (now - self._last_tts_time) > 0.8:
+                        self._last_tts_time = now
+                        self.tts.speak_token(completed_word, is_completed_word=True)
+            elif smoothed_label in ("DEL", "BACKSPACE"):
+                self.text_composer.backspace()
+            else:
+                # Full word token (e.g. HELLO, YES, NO, PEACE, OK, I LOVE YOU, CALL ME, etc.)
+                self.common_layer.add_entry(
+                    text=smoothed_label,
+                    source=self.language,
+                    mode=self.mode,
+                    confidence=confidence,
+                    metadata={"inference_ms": inference_ms},
+                )
+                self.sentence_framer.add_word(smoothed_label)
+                now = time.time()
+                if self.tts_enabled and self.tts and (now - self._last_tts_time) > 1.0:
+                    self._last_tts_time = now
+                    self.tts.speak_token(smoothed_label, is_completed_word=True)
 
         return {
             "language": self.language,
@@ -308,6 +455,9 @@ class SignLanguageAPIService:
             "smoothed_label": smoothed_label,
             "inference_ms": round(inference_ms, 1),
             "top_k": top_k,
+            "active_words": self.sentence_framer.get_active_words(),
+            "framed_sentence": self.sentence_framer.last_framed_sentence or "",
+            "auto_framed": bool(auto_framed),
             "transcript_summary": self.common_layer.get_full_transcript(),
         }
 
@@ -357,8 +507,23 @@ class SignLanguageAPIService:
         return {"error": "TTS engine not available"}
 
 
-# Global service instance
-SERVICE = SignLanguageAPIService()
+# Global service instance (lazy singleton)
+_SERVICE_INSTANCE: Optional[SignLanguageAPIService] = None
+
+
+def get_service() -> SignLanguageAPIService:
+    global _SERVICE_INSTANCE
+    if _SERVICE_INSTANCE is None:
+        _SERVICE_INSTANCE = SignLanguageAPIService()
+    return _SERVICE_INSTANCE
+
+
+class _ServiceProxy:
+    def __getattr__(self, name: str) -> Any:
+        return getattr(get_service(), name)
+
+
+SERVICE = _ServiceProxy()
 
 
 class APIRequestHandler(SimpleHTTPRequestHandler):
@@ -389,9 +554,11 @@ class APIRequestHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/status":
-            self._send_json(SERVICE.get_status())
+            self._send_json(get_service().get_status())
+        elif parsed.path == "/api/vocabulary":
+            self._send_json(get_service().get_vocabulary())
         elif parsed.path == "/api/common-text":
-            self._send_json(SERVICE.common_layer.to_dict())
+            self._send_json(get_service().common_layer.to_dict())
         elif parsed.path.startswith("/api/"):
             self._send_json({"error": "Endpoint not found"}, status=404)
         else:
@@ -407,21 +574,26 @@ class APIRequestHandler(SimpleHTTPRequestHandler):
         except Exception:
             payload = {}
 
+        svc = get_service()
         if parsed.path == "/api/config":
-            self._send_json(SERVICE.update_config(payload))
+            self._send_json(svc.update_config(payload))
         elif parsed.path == "/api/recognize/frame":
             frame_b64 = payload.get("frame", "")
-            self._send_json(SERVICE.process_frame(frame_b64))
+            self._send_json(svc.process_frame(frame_b64))
+        elif parsed.path == "/api/sentence/frame":
+            self._send_json(svc.frame_sentence())
+        elif parsed.path == "/api/sentence/clear":
+            self._send_json(svc.clear_sentence_buffer())
         elif parsed.path == "/api/speech/transcribe":
             text = payload.get("text")
             audio_b64 = payload.get("audio")
-            self._send_json(SERVICE.process_speech(text=text, audio_b64=audio_b64))
+            self._send_json(svc.process_speech(text=text, audio_b64=audio_b64))
         elif parsed.path == "/api/common-text/clear":
-            SERVICE.common_layer.clear()
+            svc.common_layer.clear()
             self._send_json({"success": True, "message": "Transcript cleared"})
         elif parsed.path == "/api/tts/speak":
             text = payload.get("text", "")
-            self._send_json(SERVICE.speak_text(text))
+            self._send_json(svc.speak_text(text))
         else:
             self._send_json({"error": "Endpoint not found"}, status=404)
 

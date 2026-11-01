@@ -32,10 +32,7 @@ class ASLRecognizer(BaseSignRecognizer):
             candidates = []
             if model_path:
                 candidates.append(Path(model_path))
-            candidates.extend([
-                Path("models/asl/pytorch_model.bin"),
-                Path("models/asl_download_test/pytorch_model.bin"),
-            ])
+            candidates.append(Path("models/asl/pytorch_model.bin"))
             selected_model = next((path for path in candidates if path.exists()), candidates[0])
 
             label_candidates = []
@@ -44,7 +41,6 @@ class ASLRecognizer(BaseSignRecognizer):
             label_candidates.extend([
                 selected_model.parent / "labels.json",
                 Path("models/asl/labels.json"),
-                Path("models/asl_download_test/labels.json"),
             ])
             selected_labels = next((str(path) for path in label_candidates if path.exists()), str(selected_model.parent / "labels.json"))
 

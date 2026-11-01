@@ -39,6 +39,19 @@ class TextEntry:
     timestamp: float = field(default_factory=time.time)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert entry to standard schema dictionary with ISO-8601 timestamp."""
+        import datetime
+        return {
+            "text": self.text,
+            "language": self.source,
+            "confidence": round(float(self.confidence), 4),
+            "source": "SIGN_RECOGNITION" if self.mode != "SPEECH" else "SPEECH_RECOGNITION",
+            "timestamp": datetime.datetime.fromtimestamp(self.timestamp, datetime.timezone.utc).isoformat(),
+            "mode": self.mode,
+            "metadata": self.metadata,
+        }
+
 
 # Backward-compatible alias
 CommonTextEntry = TextEntry

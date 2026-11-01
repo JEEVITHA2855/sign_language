@@ -25,7 +25,7 @@ class TTSEngine:
         self.rate = rate
         self.volume = volume
         self.voice_id = voice_id
-        self.mode = mode.lower() if mode else "sentence"  # "sentence", "word", "letter"
+        self.mode = mode.lower() if mode else "both"  # "both", "sentence", "word", "letter"
 
         self._queue: queue.Queue[Optional[str]] = queue.Queue(maxsize=10)
         self._thread: Optional[threading.Thread] = None
@@ -145,20 +145,20 @@ class TTSEngine:
             pass
 
     def cycle_mode(self) -> str:
-        """Cycle between speech modes: sentence -> word -> letter."""
-        modes = ["sentence", "word", "letter"]
+        """Cycle between speech modes: both -> sentence -> word -> letter."""
+        modes = ["both", "sentence", "word", "letter"]
         idx = modes.index(self.mode) if self.mode in modes else 0
         self.mode = modes[(idx + 1) % len(modes)]
         return self.mode
 
     def speak_token(self, token: str, is_completed_word: bool = False, is_sentence: bool = False) -> None:
-        """Speak according to active TTS mode (avoids letter-by-letter spam in sentence mode)."""
+        """Speak according to active TTS mode (speaks both words and full sentences in 'both' mode)."""
         if not self.enabled or not token.strip():
             return
 
-        if self.mode == "sentence" and is_sentence:
+        if self.mode in ("both", "sentence") and is_sentence:
             self.speak_async(token)
-        elif self.mode == "word" and (is_completed_word or is_sentence):
+        elif self.mode in ("both", "word") and (is_completed_word or is_sentence):
             self.speak_async(token)
         elif self.mode == "letter":
             self.speak_async(token)

@@ -1,9 +1,30 @@
 .env
 __pycache__/
 *.pyc
+.pytest_cache/
 .venv/
 venv/
 models/downloaded/
 checkpoints/
 logs/
 .streamlit/secrets.toml
+
+# Scratch and temporary exploratory scripts
+scratch_*.py
+
+# LaTeX and report build artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+project_report.*
+
+# OS / Editor artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*~
+

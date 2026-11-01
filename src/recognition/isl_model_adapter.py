@@ -15,7 +15,7 @@ class ISLModelAdapter:
     """Adapter for the downloaded ISL checkpoints, using the actual config and model files if present."""
 
     def __init__(self, model_dir: str | None = None, labels_path: str | None = None):
-        self.model_dir = Path(model_dir or 'models/isl_download_check')
+        self.model_dir = Path(model_dir or 'models/isl')
         self.labels_path = Path(labels_path or (self.model_dir / 'labels.json'))
         self.model = None
         self.labels = self._load_labels()

@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+import time
 from dataclasses import dataclass, field
 from typing import Dict, Any
 
@@ -8,11 +7,18 @@ from typing import Dict, Any
 class RecognitionResult:
     label: str
     confidence: float
-    language: str
-    mode: str
-    timestamp: float
-    source: str
+    language: str = "ASL"
+    mode: str = "WORD"
+    timestamp: float = field(default_factory=time.time)
+    source: str = "SIGN_RECOGNITION"
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def is_confident(self, threshold: float = 0.65) -> bool:
+        """Check if prediction meets confidence threshold and is not an error label."""
+        return (
+            self.confidence >= threshold
+            and self.label not in ("NONE", "UNCERTAIN", "UNKNOWN", "MODEL_UNAVAILABLE", "ERROR")
+        )
 
     @property
     def top_k(self) -> list:

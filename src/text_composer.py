@@ -75,10 +75,25 @@ class TextComposer:
         if self.consecutive_no_hand_frames == self.no_hand_timeout_frames:
             # Flush any pending spelled letters into a completed word
             if self.current_word_chars:
-                self.tokens.append("".join(self.current_word_chars))
+                completed = "".join(self.current_word_chars)
+                self.tokens.append(completed)
                 self.current_word_chars.clear()
-                return self.get_current_sentence()
+                return completed
 
+        return None
+
+    def get_current_word(self) -> str:
+        """Return the word currently being spelled, or the last completed word if chars empty."""
+        if self.current_word_chars:
+            return "".join(self.current_word_chars)
+        if self.tokens:
+            return self.tokens[-1]
+        return ""
+
+    def get_last_completed_word(self) -> Optional[str]:
+        """Return the most recently finalized word from tokens list."""
+        if self.tokens:
+            return self.tokens[-1]
         return None
 
     def get_raw_stream(self) -> str:

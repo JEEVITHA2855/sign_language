@@ -1,0 +1,11 @@
+{
+  "language": "ASL",
+  "num_classes": 51,
+  "epochs_trained": 8,
+  "best_epoch": 1,
+  "best_val_f1": 0.0008,
+  "test_accuracy": 0.0196,
+  "test_macro_f1": 0.0008,
+  "training_time_seconds": 14.52,
+  "checkpoint_path": "models\\everyday_signs\\ASL\\best_model.pth"
+}
